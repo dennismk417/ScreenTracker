@@ -58,7 +58,7 @@ public class MainActivity extends Activity {
 
     boolean hasUsageAccess() {
         AppOpsManager ops = getSystemService(AppOpsManager.class);
-        return ops.unsafeCheckOpNoThrow(AppOpsManager.OPSTR_GET_USAGE_STATS, Process.myUid(), getPackageName()) == AppOpsManager.MODE_ALLOWED;
+        return ops.unsafeCheckOpNoThrow(AppOpsManager.OPSTR_GET_USAGE_STATS, android.os.Process.myUid(), getPackageName()) == AppOpsManager.MODE_ALLOWED;
     }
 
     void render() {
