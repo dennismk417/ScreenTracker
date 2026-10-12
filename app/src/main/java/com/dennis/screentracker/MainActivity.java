@@ -55,9 +55,11 @@ public class MainActivity extends Activity {
 
         static void schedule(Context c) {
             JobScheduler js = c.getSystemService(JobScheduler.class);
-            if (js.getPendingJob(1) != null) return;
-            js.schedule(new JobInfo.Builder(1, new ComponentName(c, ChargeWatchJob.class))
-                    .setPeriodic(15 * 60 * 1000L).setPersisted(true).build());
+            js.cancel(1); // old always-on job from earlier versions
+            if (js.getPendingJob(3) != null) return;
+            // Runs ONLY while the phone is on a charger. On battery the app never wakes up by itself.
+            js.schedule(new JobInfo.Builder(3, new ComponentName(c, ChargeWatchJob.class))
+                    .setRequiresCharging(true).setPeriodic(15 * 60 * 1000L).setPersisted(true).build());
         }
 
         static JSONObject newCycle(long t, int lvl, boolean partial) throws Exception {
@@ -92,10 +94,17 @@ public class MainActivity extends Activity {
                 } else if (!known && !plugged && cycles.length() == 0) {
                     cycles.put(newCycle(now, lvl, true));           // first run: start tracking now
                 } else if (was && !plugged) {
-                    cycles.put(newCycle(now, lvl, false));          // just unplugged
-                } else if (!was && plugged && open != null) {
-                    open.put("p", now);                             // just plugged in
-                    open.put("pl", p.getInt("lastLvl", lvl));
+                    // Unplugged: the last time we saw it charging is the unplug time (within ~15 min).
+                    long lpT = p.getLong("lastPlugT", 0);
+                    cycles.put(newCycle(lpT > 0 ? lpT : now, lpT > 0 ? p.getInt("lastPlugLvl", lvl) : lvl, false));
+                } else if (!was && plugged) {
+                    if (open != null) { open.put("p", now); open.put("pl", lvl); }   // just plugged in
+                } else if (was && plugged && known) {
+                    // Still charging, but battery is lower than last check: it was unplugged and
+                    // re-plugged while the app wasn't open. Record that missed cycle.
+                    long lpT = p.getLong("lastPlugT", 0);
+                    int lpL = p.getInt("lastPlugLvl", lvl);
+                    if (lpT > 0 && lvl <= lpL - 2) cycles.put(newCycle(lpT, lpL, false).put("p", now).put("pl", lvl));
                 }
 
                 long lastT = samples.length() > 0 ? samples.getJSONArray(samples.length() - 1).getLong(0) : 0;
@@ -111,7 +120,9 @@ public class MainActivity extends Activity {
                 for (int i = 0; i < samples.length(); i++)
                     if (samples.getJSONArray(i).getLong(0) > cutoff) keepS.put(samples.getJSONArray(i));
 
-                p.edit().putBoolean("plugged", plugged).putInt("lastLvl", lvl)
+                SharedPreferences.Editor ed = p.edit();
+                if (plugged) ed.putLong("lastPlugT", now).putInt("lastPlugLvl", lvl);
+                ed.putBoolean("plugged", plugged).putInt("lastLvl", lvl)
                         .putString("cycles", keepC.toString()).putString("samples", keepS.toString()).apply();
             } catch (Exception ignored) { }
         }
@@ -375,7 +386,7 @@ public class MainActivity extends Activity {
         LinearLayout f = card(root);
         button(f, "Refresh", v -> load());
         button(f, "Mark \"just unplugged\" now", v -> { ChargeWatchJob.markUnplugged(this); load(); });
-        text(f, "Charging is checked about every 15 min, so times can be up to 15 min off, and temperatures are sampled at the same rate (and whenever you open the app). Allow background activity for this app in "
+        text(f, "To save battery, the app only wakes up while charging (about every 15 min). Unplug time can be up to 15 min off; plug-in is detected within minutes. On battery, temperatures and the graph are sampled only when you open the app. Allow background activity for this app in "
                 + "Settings > Battery for best results. Per-app battery % is an estimate: Android doesn't let apps read real per-app "
                 + "battery use, so the cycle's battery drop is split by each app's on-screen time plus 30% weight for background (foreground-service) time. Includes system apps. Pure background work without a notification (e.g. cell standby) can't be seen by apps.", 12, SUB, false);
     }
@@ -687,9 +698,38 @@ public class MainActivity extends Activity {
                 }
                 cv.drawPath(path, line);
             }
-            cv.drawText(hm(from), 0, h - 4 * d, txt);
-            String e = hm(to);
-            cv.drawText(e, right - txt.measureText(e), h - 4 * d, txt);
+            // Hourly time axis: a tick + faint line every hour, labels every hour if they fit
+            // (otherwise every 2/3/4/6/12 h so they don't overlap).
+            long span = Math.max(1, to - from);
+            Calendar cal = Calendar.getInstance();
+            cal.setTimeInMillis(from);
+            cal.set(Calendar.MINUTE, 0); cal.set(Calendar.SECOND, 0); cal.set(Calendar.MILLISECOND, 0);
+            if (cal.getTimeInMillis() < from) cal.add(Calendar.HOUR_OF_DAY, 1);
+            float hourPx = right * 3600000f / span;
+            float labelW = txt.measureText("12am") + 8 * d;
+            int step = 1;
+            for (int st : new int[]{1, 2, 3, 4, 6, 12, 24}) { step = st; if (hourPx * st >= labelW) break; }
+            Paint tick = new Paint(grid);
+            tick.setAlpha(70);
+            SimpleDateFormat lf = new SimpleDateFormat("ha", Locale.US);
+            if (cal.getTimeInMillis() > to) { // less than an hour on battery: show start and end time
+                cv.drawText(hm(from), 0, h - 4 * d, txt);
+                String e = hm(to);
+                cv.drawText(e, right - txt.measureText(e), h - 4 * d, txt);
+            }
+            while (cal.getTimeInMillis() <= to) {
+                long t = cal.getTimeInMillis();
+                float x = right * ((t - from) / (float) span);
+                cv.drawLine(x, top, x, bottom, tick);
+                int hr = cal.get(Calendar.HOUR_OF_DAY);
+                if (hr % step == 0) {
+                    String l = lf.format(new Date(t)).toLowerCase(Locale.US);
+                    float lw = txt.measureText(l);
+                    float lx = Math.max(0, Math.min(right - lw, x - lw / 2));
+                    cv.drawText(l, lx, h - 4 * d, txt);
+                }
+                cal.add(Calendar.HOUR_OF_DAY, 1);
+            }
         }
     }
 
