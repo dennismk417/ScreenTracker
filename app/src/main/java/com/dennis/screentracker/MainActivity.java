@@ -8,6 +8,7 @@ import android.app.job.JobScheduler;
 import android.app.job.JobService;
 import android.app.usage.UsageEvents;
 import android.app.usage.UsageStatsManager;
+import android.content.BroadcastReceiver;
 import android.content.ComponentName;
 import android.content.Context;
 import android.content.Intent;
@@ -55,11 +56,16 @@ public class MainActivity extends Activity {
 
         static void schedule(Context c) {
             JobScheduler js = c.getSystemService(JobScheduler.class);
-            js.cancel(1); // old always-on job from earlier versions
-            if (js.getPendingJob(3) != null) return;
-            // Runs ONLY while the phone is on a charger. On battery the app never wakes up by itself.
-            js.schedule(new JobInfo.Builder(3, new ComponentName(c, ChargeWatchJob.class))
-                    .setRequiresCharging(true).setPeriodic(15 * 60 * 1000L).setPersisted(true).build());
+            js.cancel(1); js.cancel(3); // old jobs from earlier versions
+            if (js.getPendingJob(4) != null) return;
+            arm(c);
+        }
+
+        /** One-shot job that can only run while charging. Android stops it the moment the cable is
+         *  removed, which is how we catch the exact unplug time. Never runs on battery. */
+        static void arm(Context c) {
+            c.getSystemService(JobScheduler.class).schedule(new JobInfo.Builder(4, new ComponentName(c, ChargeWatchJob.class))
+                    .setRequiresCharging(true).setPersisted(true).build());
         }
 
         static JSONObject newCycle(long t, int lvl, boolean partial) throws Exception {
@@ -96,7 +102,8 @@ public class MainActivity extends Activity {
                 } else if (was && !plugged) {
                     // Unplugged: the last time we saw it charging is the unplug time (within ~15 min).
                     long lpT = p.getLong("lastPlugT", 0);
-                    cycles.put(newCycle(lpT > 0 ? lpT : now, lpT > 0 ? p.getInt("lastPlugLvl", lvl) : lvl, false));
+                    // Level can only fall after unplugging, so the start level is at least the current one.
+                    cycles.put(newCycle(lpT > 0 ? lpT : now, Math.max(lvl, lpT > 0 ? p.getInt("lastPlugLvl", lvl) : lvl), false));
                 } else if (!was && plugged) {
                     if (open != null) { open.put("p", now); open.put("pl", lvl); }   // just plugged in
                 } else if (was && plugged && known) {
@@ -149,8 +156,35 @@ public class MainActivity extends Activity {
             try (BufferedReader r = new BufferedReader(new FileReader(f))) { String l = r.readLine(); return l == null ? "" : l; }
         }
 
-        @Override public boolean onStartJob(JobParameters params) { check(this); return false; }
-        @Override public boolean onStopJob(JobParameters params) { return true; }
+        BroadcastReceiver rx;
+        long lastRx;
+
+        @Override public boolean onStartJob(JobParameters params) {
+            check(this);
+            // Stay awake while charging (costs nothing - the charger powers it) and follow the battery level,
+            // so the last level before unplugging is exact.
+            rx = new BroadcastReceiver() {
+                @Override public void onReceive(Context ctx, Intent i) {
+                    long now = System.currentTimeMillis();
+                    if (now - lastRx < 20000) return;
+                    lastRx = now;
+                    check(ctx);
+                }
+            };
+            IntentFilter f = new IntentFilter(Intent.ACTION_BATTERY_CHANGED);
+            if (android.os.Build.VERSION.SDK_INT >= 33) registerReceiver(rx, f, Context.RECEIVER_NOT_EXPORTED);
+            else registerReceiver(rx, f);
+            return true;
+        }
+
+        @Override public boolean onStopJob(JobParameters params) {
+            // Called the instant the charger is removed (or after Android's ~10 min job limit).
+            try { if (rx != null) unregisterReceiver(rx); } catch (Exception ignored) { }
+            rx = null;
+            check(this);
+            arm(this);   // re-arm: starts again right away if still charging, otherwise waits for next plug-in
+            return false;
+        }
     }
 
     // ================= Data model =================
