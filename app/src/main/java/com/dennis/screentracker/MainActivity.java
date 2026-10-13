@@ -426,8 +426,32 @@ public class MainActivity extends Activity {
         if (curPkg != null && on) addAppB(out, bounds, false, curPkg, curStart, to);
         for (Map.Entry<String, Long> o : fgs.entrySet())
             addAppB(out, bounds, true, o.getKey().substring(0, o.getKey().indexOf('|')), o.getValue(), to);
-        for (Stats st : out) { st.apps.remove(getPackageName()); st.bg.remove(getPackageName()); }
+        // Screen-on time no app claimed = home screen / lock screen / notification shade.
+        // ColorOS often doesn't log the launcher when you swipe home, so give it that leftover time
+        // (this is what the phone's own Battery page counts as "System Launcher").
+        String home = launcherPkg();
+        for (Stats st : out) {
+            long claimed = 0;
+            for (long v : st.apps.values()) claimed += v;
+            long rest = st.on - claimed;
+            if (home != null && rest > 0) st.apps.merge(home, rest, Long::sum);
+            st.apps.remove(getPackageName());
+            st.bg.remove(getPackageName());
+        }
         return out;
+    }
+
+    String homePkg;
+
+    String launcherPkg() {
+        if (homePkg != null) return homePkg;
+        try {
+            android.content.pm.ResolveInfo ri = getPackageManager().resolveActivity(
+                    new Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_HOME), PackageManager.MATCH_DEFAULT_ONLY);
+            if (ri != null && ri.activityInfo != null && !"android".equals(ri.activityInfo.packageName))
+                homePkg = ri.activityInfo.packageName;
+        } catch (Exception ignored) { }
+        return homePkg;
     }
 
     static long clip(long a, long b, long from, long to) { return Math.max(0, Math.min(b, to) - Math.max(a, from)); }
@@ -643,8 +667,10 @@ public class MainActivity extends Activity {
         name.setTextColor(TXT);
         TextView info = new TextView(this);
         String pct;
-        if (used >= 0 && total > 0) pct = String.format(Locale.US, "≈%.1f%%", used * w / total);
-        else pct = String.format(Locale.US, "%.1f%% of usage", total > 0 ? 100.0 * w / total : 0);
+        // Share of this period's battery use (all apps add up to 100%, like the phone's Battery page),
+        // plus the estimated chunk of the whole battery it used.
+        pct = String.format(Locale.US, "%.2f%%", total > 0 ? 100.0 * w / total : 0);
+        if (used >= 0 && total > 0) pct += String.format(Locale.US, " (≈%.1f%% battery)", used * w / total);
         String time = ms > 0 ? fmt(ms) + " on screen" : "";
         if (bgMs >= 60000) time += (time.isEmpty() ? "" : " · ") + fmt(bgMs) + " background";
         if (time.isEmpty()) time = "<1 min";
