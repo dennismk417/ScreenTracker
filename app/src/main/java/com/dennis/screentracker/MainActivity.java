@@ -212,13 +212,14 @@ public class MainActivity extends Activity {
     interface OnPick { void pick(int i); }
 
     LinearLayout root;
-    int tab = 0, selDay = 6;
+    int tab = 0, selDay = 6, selHour = 23;
     boolean loading, reload, chargingNow;
     int curLvl = -1;
     Seg cur, lastDone, dayTotal;
     List<Seg> daySegs = new ArrayList<>();
     List<long[]> chartPts = new ArrayList<>();
-    long[] dayOn = new long[7], dayStarts = new long[7];
+    long[] dayOn = new long[7], dayStarts = new long[7], hourOn = new long[24], hourStarts = new long[25];
+    Seg hourSeg;
     final Map<String, Drawable> iconCache = new HashMap<>();
     final Map<String, String> labelCache = new HashMap<>();
 
@@ -251,9 +252,9 @@ public class MainActivity extends Activity {
     void load() {
         if (loading) { reload = true; return; }
         loading = true;
-        final int t = tab, d = selDay;
+        final int t = tab, d = selDay, hsel = selHour;
         new Thread(() -> {
-            try { computeModel(t, d); } catch (Exception ignored) { }
+            try { computeModel(t, d, hsel); } catch (Exception ignored) { }
             runOnUiThread(() -> {
                 loading = false;
                 if (reload) { reload = false; load(); return; }
@@ -263,7 +264,7 @@ public class MainActivity extends Activity {
     }
 
     // ================= Computation =================
-    void computeModel(int t, int d) throws Exception {
+    void computeModel(int t, int d, int hsel) throws Exception {
         ChargeWatchJob.check(this);
         SharedPreferences p = getSharedPreferences(ChargeWatchJob.PREFS, 0);
         long now = System.currentTimeMillis();
@@ -300,6 +301,25 @@ public class MainActivity extends Activity {
                 if (s.endLvl >= 0) pts.add(new long[]{s.to, s.endLvl});
                 temps(s, samples);
             }
+        } else if (t == 1) {
+            long[] hb = new long[25];
+            long hourNow = now - now % 3600000L; // start of current hour
+            for (int i = 0; i <= 23; i++) hb[i] = hourNow - (23 - i) * 3600000L;
+            hb[24] = now;
+            Stats[] hs = computeMulti(hb);
+            long[] hon = new long[24];
+            for (int i = 0; i < 24; i++) hon[i] = hs[i].on;
+            Seg hseg = new Seg();
+            hseg.from = hb[hsel]; hseg.to = hb[hsel + 1];
+            hseg.st = hs[hsel];
+            int used = 0; boolean any = false;
+            for (int i = 0; i < cycles.length(); i++) {
+                Seg cs = cycleSeg(cycles.getJSONObject(i), now, hseg.from, hseg.to);
+                if (cs != null && cs.used >= 0) { used += cs.used; any = true; if (cs.est) hseg.est = true; }
+            }
+            hseg.used = any ? used : -1;
+            temps(hseg, samples);
+            runOnUiThread(() -> { hourOn = hon; hourStarts = hb; hourSeg = hseg; });
         } else {
             for (int i = 0; i < 7; i++) on[i] = compute(starts[i], i == 6 ? now : starts[i + 1]).on;
             long ds = starts[d], de = d == 6 ? now : starts[d + 1];
@@ -323,7 +343,7 @@ public class MainActivity extends Activity {
         runOnUiThread(() -> {
             cur = fc0; lastDone = fdone; dayTotal = ftotal;
             chartPts = pts; dayStarts = starts; daySegs = segs;
-            if (t == 1) dayOn = on;
+            if (t == 2) dayOn = on;
         });
     }
 
@@ -355,50 +375,70 @@ public class MainActivity extends Activity {
         return s;
     }
 
-    Stats compute(long from, long to) {
+    Stats compute(long from, long to) { return computeMulti(new long[]{from, to})[0]; }
+
+    /** One pass over Android's activity log, split into consecutive buckets bounds[i]..bounds[i+1]. */
+    Stats[] computeMulti(long[] bounds) {
+        int nb = bounds.length - 1;
+        long from = bounds[0], to = bounds[nb];
+        Stats[] out = new Stats[nb];
+        for (int i = 0; i < nb; i++) out[i] = new Stats();
         UsageStatsManager usm = getSystemService(UsageStatsManager.class);
-        UsageEvents ev = usm.queryEvents(from, to);
+        // Look back 6 h before the window so apps that were already open at the start are counted;
+        // all time is clipped to [from, to].
+        UsageEvents ev = usm.queryEvents(from - 6 * 3600000L, to);
         UsageEvents.Event e = new UsageEvents.Event();
-        Stats s = new Stats();
         Boolean on = null;
-        long last = from;
-        Map<String, Long> openSince = new HashMap<>(), fgs = new HashMap<>();
+        long last = from - 6 * 3600000L;
+        String curPkg = null, curCls = null;   // the one app screen currently in front
+        long curStart = 0;
+        Map<String, Long> fgs = new HashMap<>();
         while (ev.hasNextEvent()) {
             ev.getNextEvent(e);
             long t = e.getTimeStamp();
             int type = e.getEventType();
+            String pkg = e.getPackageName(), cls = e.getClassName();
             if (type == UsageEvents.Event.SCREEN_INTERACTIVE || type == UsageEvents.Event.SCREEN_NON_INTERACTIVE) {
                 boolean isOn = type == UsageEvents.Event.SCREEN_INTERACTIVE;
                 if (on == null) on = !isOn;
-                if (on) s.on += t - last; else s.off += t - last;
+                for (int i = 0; i < nb; i++) { long sp = clip(last, t, bounds[i], bounds[i + 1]); if (on) out[i].on += sp; else out[i].off += sp; }
                 on = isOn; last = t;
-                if (!isOn) closeAll(openSince, s, t);
+                if (!isOn && curPkg != null) { addAppB(out, bounds, false, curPkg, curStart, t); curPkg = null; }
             } else if (type == UsageEvents.Event.ACTIVITY_RESUMED) {
-                closeAll(openSince, s, t);
-                openSince.put(e.getPackageName(), t);
-            } else if (type == UsageEvents.Event.FOREGROUND_SERVICE_START) {
-                fgs.put(e.getPackageName() + "|" + e.getClassName(), t);
-            } else if (type == UsageEvents.Event.FOREGROUND_SERVICE_STOP) {
-                Long st = fgs.remove(e.getPackageName() + "|" + e.getClassName());
-                if (st != null) s.bg.merge(e.getPackageName(), t - st, Long::sum);
+                if (curPkg != null) addAppB(out, bounds, false, curPkg, curStart, t);
+                curPkg = pkg; curCls = cls; curStart = t;
             } else if (type == UsageEvents.Event.ACTIVITY_PAUSED || type == UsageEvents.Event.ACTIVITY_STOPPED) {
-                Long st = openSince.remove(e.getPackageName());
-                if (st != null) s.apps.merge(e.getPackageName(), t - st, Long::sum);
+                // Only stop counting if the screen being closed is the one in front. Apps (games especially)
+                // often open a new screen before the old one reports closing.
+                if (curPkg != null && curPkg.equals(pkg) && (curCls == null || cls == null || curCls.equals(cls))) {
+                    addAppB(out, bounds, false, curPkg, curStart, t);
+                    curPkg = null;
+                }
+            } else if (type == UsageEvents.Event.FOREGROUND_SERVICE_START) {
+                fgs.put(pkg + "|" + cls, t);
+            } else if (type == UsageEvents.Event.FOREGROUND_SERVICE_STOP) {
+                Long st = fgs.remove(pkg + "|" + cls);
+                if (st != null) addAppB(out, bounds, true, pkg, st, t);
             }
         }
         if (on == null) on = getSystemService(PowerManager.class).isInteractive();
-        if (on) s.on += to - last; else s.off += to - last;
-        closeAll(openSince, s, to);
+        for (int i = 0; i < nb; i++) { long sp = clip(last, to, bounds[i], bounds[i + 1]); if (on) out[i].on += sp; else out[i].off += sp; }
+        if (curPkg != null && on) addAppB(out, bounds, false, curPkg, curStart, to);
         for (Map.Entry<String, Long> o : fgs.entrySet())
-            s.bg.merge(o.getKey().substring(0, o.getKey().indexOf('|')), to - o.getValue(), Long::sum);
-        s.apps.remove(getPackageName());
-        s.bg.remove(getPackageName());
-        return s;
+            addAppB(out, bounds, true, o.getKey().substring(0, o.getKey().indexOf('|')), o.getValue(), to);
+        for (Stats st : out) { st.apps.remove(getPackageName()); st.bg.remove(getPackageName()); }
+        return out;
     }
 
-    static void closeAll(Map<String, Long> open, Stats s, long t) {
-        for (Map.Entry<String, Long> o : open.entrySet()) s.apps.merge(o.getKey(), t - o.getValue(), Long::sum);
-        open.clear();
+    static long clip(long a, long b, long from, long to) { return Math.max(0, Math.min(b, to) - Math.max(a, from)); }
+
+    static void addAppB(Stats[] out, long[] bounds, boolean bg, String pkg, long a, long b) {
+        for (int i = 0; i < out.length; i++) addApp(bg ? out[i].bg : out[i].apps, pkg, a, b, bounds[i], bounds[i + 1]);
+    }
+
+    static void addApp(Map<String, Long> m, String pkg, long a, long b, long from, long to) {
+        long d = clip(a, b, from, to);
+        if (d > 0) m.merge(pkg, d, Long::sum);
     }
 
     // ================= UI =================
@@ -416,7 +456,7 @@ public class MainActivity extends Activity {
         root.removeAllViews();
         title("Battery");
         tabs();
-        if (tab == 0) buildSince(); else buildWeek();
+        if (tab == 0) buildSince(); else if (tab == 1) buildHours(); else buildWeek();
         LinearLayout f = card(root);
         button(f, "Refresh", v -> load());
         button(f, "Mark \"just unplugged\" now", v -> { ChargeWatchJob.markUnplugged(this); load(); });
@@ -429,8 +469,8 @@ public class MainActivity extends Activity {
         LinearLayout bar = new LinearLayout(this);
         bar.setBackground(round(CARD, 24));
         bar.setPadding(dp(4), dp(4), dp(4), dp(4));
-        String[] names = {"Since last charge", "Last 7 days"};
-        for (int i = 0; i < 2; i++) {
+        String[] names = {"Since charge", "24 hours", "7 days"};
+        for (int i = 0; i < names.length; i++) {
             final int idx = i;
             TextView t = new TextView(this);
             t.setText(names[i]);
@@ -465,6 +505,27 @@ public class MainActivity extends Activity {
         c.addView(new LineChart(this, chartPts, s.from, s.to), lp);
         statsRow(c, s);
         appsCard(s, "Battery usage by app", null, false);
+    }
+
+    void buildHours() {
+        if (hourSeg == null) return;
+        LinearLayout c = card(root);
+        text(c, "Screen on per hour — tap an hour", 13, SUB, false);
+        String[] labels = new String[24];
+        SimpleDateFormat f = new SimpleDateFormat("HH", Locale.US);
+        for (int i = 0; i < 24; i++) {
+            Calendar k = Calendar.getInstance();
+            k.setTimeInMillis(hourStarts[i]);
+            labels[i] = i == 23 ? "Now" : (k.get(Calendar.HOUR_OF_DAY) % 4 == 0 ? f.format(new Date(hourStarts[i])) : "");
+        }
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(-1, dp(190));
+        lp.topMargin = dp(8);
+        c.addView(new BarChart(this, hourOn, labels, selHour, i -> { selHour = i; load(); }), lp);
+        SimpleDateFormat hf = new SimpleDateFormat("HH:mm", Locale.US);
+        String range = hf.format(new Date(hourStarts[selHour])) + "–" + (selHour == 23 ? "now" : hf.format(new Date(hourStarts[selHour + 1])));
+        text(c, range, 18, TXT, true).setPadding(0, dp(14), 0, 0);
+        statsRow(c, hourSeg);
+        appsCard(hourSeg, "Battery usage by app (" + range + ")", null, false);
     }
 
     void buildWeek() {
@@ -792,7 +853,7 @@ public class MainActivity extends Activity {
             float slot = right / v.length;
             txt.setColor(SUB);
             cv.drawLine(0, bottom, right, bottom, grid);
-            cv.drawText(maxH + "h", right + 6 * d, top + 4 * d, txt);
+            cv.drawText(maxH == 1 && max <= 3600000L ? "60m" : maxH + "h", right + 6 * d, top + 4 * d, txt);
             cv.drawText("0h", right + 6 * d, bottom + 4 * d, txt);
             for (int i = 0; i < v.length; i++) {
                 float bh = (bottom - top) * v[i] / (float) (maxH * 3600000L);
@@ -800,8 +861,11 @@ public class MainActivity extends Activity {
                 bar.setColor(i == sel ? BLUE : GREY);
                 cv.drawRoundRect(r, 4 * d, 4 * d, bar);
                 txt.setColor(i == sel ? TXT : SUB);
-                float lw = txt.measureText(labels[i]);
-                cv.drawText(labels[i], i * slot + (slot - lw) / 2, h - 4 * d, txt);
+                if (!labels[i].isEmpty()) {
+                    float lw = txt.measureText(labels[i]);
+                    float lx = Math.max(0, Math.min(right - lw, i * slot + (slot - lw) / 2));
+                    cv.drawText(labels[i], lx, h - 4 * d, txt);
+                }
                 if (i == sel) {
                     String s = fmt(v[i]);
                     float sw = txt.measureText(s);
