@@ -43,6 +43,8 @@ import java.util.ArrayList;
 import java.util.Calendar;
 import java.util.Date;
 import java.util.HashMap;
+import java.util.HashSet;
+import java.util.Set;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
@@ -390,8 +392,10 @@ public class MainActivity extends Activity {
         UsageEvents.Event e = new UsageEvents.Event();
         Boolean on = null;
         long last = from - 6 * 3600000L;
-        String curPkg = null, curCls = null;   // the one app screen currently in front
-        long curStart = 0;
+        // Every app currently visible. Several can be at once (floating window / split screen).
+        // pkg -> set of its open screens, and pkg -> when it became visible.
+        Map<String, Set<String>> openCls = new HashMap<>();
+        Map<String, Long> visibleSince = new HashMap<>();
         Map<String, Long> fgs = new HashMap<>();
         while (ev.hasNextEvent()) {
             ev.getNextEvent(e);
@@ -403,16 +407,27 @@ public class MainActivity extends Activity {
                 if (on == null) on = !isOn;
                 for (int i = 0; i < nb; i++) { long sp = clip(last, t, bounds[i], bounds[i + 1]); if (on) out[i].on += sp; else out[i].off += sp; }
                 on = isOn; last = t;
-                if (!isOn && curPkg != null) { addAppB(out, bounds, false, curPkg, curStart, t); curPkg = null; }
+                if (!isOn) {   // screen off: nothing is visible any more
+                    for (Map.Entry<String, Long> v : visibleSince.entrySet()) addAppB(out, bounds, false, v.getKey(), v.getValue(), t);
+                    visibleSince.clear();
+                    openCls.clear();
+                }
             } else if (type == UsageEvents.Event.ACTIVITY_RESUMED) {
-                if (curPkg != null) addAppB(out, bounds, false, curPkg, curStart, t);
-                curPkg = pkg; curCls = cls; curStart = t;
+                Set<String> set = openCls.get(pkg);
+                if (set == null) { set = new HashSet<>(); openCls.put(pkg, set); }
+                set.add(String.valueOf(cls));
+                if (!visibleSince.containsKey(pkg)) visibleSince.put(pkg, t);
             } else if (type == UsageEvents.Event.ACTIVITY_PAUSED || type == UsageEvents.Event.ACTIVITY_STOPPED) {
-                // Only stop counting if the screen being closed is the one in front. Apps (games especially)
-                // often open a new screen before the old one reports closing.
-                if (curPkg != null && curPkg.equals(pkg) && (curCls == null || cls == null || curCls.equals(cls))) {
-                    addAppB(out, bounds, false, curPkg, curStart, t);
-                    curPkg = null;
+                // Close only that screen. The app keeps counting while any of its screens is still showing
+                // (e.g. a game switching screens, or a floating window while another app is full screen).
+                Set<String> set = openCls.get(pkg);
+                if (set != null) {
+                    set.remove(String.valueOf(cls));
+                    if (set.isEmpty()) {
+                        openCls.remove(pkg);
+                        Long st = visibleSince.remove(pkg);
+                        if (st != null) addAppB(out, bounds, false, pkg, st, t);
+                    }
                 }
             } else if (type == UsageEvents.Event.FOREGROUND_SERVICE_START) {
                 fgs.put(pkg + "|" + cls, t);
@@ -423,7 +438,7 @@ public class MainActivity extends Activity {
         }
         if (on == null) on = getSystemService(PowerManager.class).isInteractive();
         for (int i = 0; i < nb; i++) { long sp = clip(last, to, bounds[i], bounds[i + 1]); if (on) out[i].on += sp; else out[i].off += sp; }
-        if (curPkg != null && on) addAppB(out, bounds, false, curPkg, curStart, to);
+        if (on) for (Map.Entry<String, Long> v : visibleSince.entrySet()) addAppB(out, bounds, false, v.getKey(), v.getValue(), to);
         for (Map.Entry<String, Long> o : fgs.entrySet())
             addAppB(out, bounds, true, o.getKey().substring(0, o.getKey().indexOf('|')), o.getValue(), to);
         // Screen-on time no app claimed = home screen / lock screen / notification shade.
@@ -887,17 +902,25 @@ public class MainActivity extends Activity {
                 bar.setColor(i == sel ? BLUE : GREY);
                 cv.drawRoundRect(r, 4 * d, 4 * d, bar);
                 txt.setColor(i == sel ? TXT : SUB);
-                if (!labels[i].isEmpty()) {
-                    float lw = txt.measureText(labels[i]);
-                    float lx = Math.max(0, Math.min(right - lw, i * slot + (slot - lw) / 2));
-                    cv.drawText(labels[i], lx, h - 4 * d, txt);
-                }
+
                 if (i == sel) {
                     String s = fmt(v[i]);
                     float sw = txt.measureText(s);
                     float x = Math.max(0, Math.min(right - sw, i * slot + (slot - sw) / 2));
                     cv.drawText(s, x, bottom - bh - 6 * d, txt);
                 }
+            }
+            // Axis labels, drawn right-to-left so "Now"/"Today" always shows; any label that would
+            // touch its neighbour is skipped instead of overlapping.
+            float nextLeft = Float.MAX_VALUE;
+            for (int i = v.length - 1; i >= 0; i--) {
+                if (labels[i].isEmpty()) continue;
+                float lw = txt.measureText(labels[i]);
+                float lx = Math.max(0, Math.min(right - lw, i * slot + (slot - lw) / 2));
+                if (lx + lw + 6 * d > nextLeft) continue;
+                txt.setColor(i == sel ? TXT : SUB);
+                cv.drawText(labels[i], lx, h - 4 * d, txt);
+                nextLeft = lx;
             }
         }
 
