@@ -209,6 +209,8 @@ public class MainActivity extends Activity {
         int startLvl = -1, endLvl = -1, used = -1;
         boolean est, partial;
         Stats st = new Stats();
+        Stats tracked;        // usage only while on battery AND tracked (what the drop is shared over); null = same as st
+        long trackedMs = -1;  // length of that tracked time; -1 = whole segment
     }
 
     interface OnPick { void pick(int i); }
@@ -395,11 +397,13 @@ public class MainActivity extends Activity {
             hseg.from = hb[hsel]; hseg.to = hb[hsel + 1];
             hseg.st = hs[hsel];
             int used = 0; boolean any = false;
+            List<Seg> parts = new ArrayList<>();
             for (int i = 0; i < cycles.length(); i++) {
                 Seg cs = cycleSeg(cycles.getJSONObject(i), now, hseg.from, hseg.to);
-                if (cs != null && cs.used >= 0) { used += cs.used; any = true; if (cs.est) hseg.est = true; }
+                if (cs != null && cs.used >= 0) { used += cs.used; any = true; if (cs.est) hseg.est = true; cs.st = new Stats(); parts.add(cs); }
             }
             hseg.used = any ? used : -1;
+            if (any) attachTracked(hseg, parts);
             temps(hseg, samples);
             runOnUiThread(() -> { hourOn = hon; hourStarts = hb; hourSeg = hseg; });
         } else {
@@ -417,8 +421,9 @@ public class MainActivity extends Activity {
             int used = 0; boolean any = false;
             for (Seg s : segs) if (s.used >= 0) { used += s.used; any = true; if (s.est) total.est = true; }
             total.used = any ? used : -1;
-            if (segs.size() >= 2) for (Seg s : segs) s.st = compute(s.from, s.to);
-            else segs.clear();
+            for (Seg s : segs) s.st = compute(s.from, s.to);
+            if (any) attachTracked(total, segs);
+            if (segs.size() < 2) segs.clear();
         }
 
         final Seg fc0 = c0, fdone = done, ftotal = total;
@@ -440,6 +445,25 @@ public class MainActivity extends Activity {
             prev = p;
         }
         return prev == null ? -1 : (int) prev[1];
+    }
+
+    static void merge(Stats into, Stats add) {
+        into.on += add.on; into.off += add.off;
+        for (Map.Entry<String, Long> e : add.apps.entrySet()) into.apps.merge(e.getKey(), e.getValue(), Long::sum);
+        for (Map.Entry<String, Long> e : add.bg.entrySet()) into.bg.merge(e.getKey(), e.getValue(), Long::sum);
+    }
+
+    /** Usage inside the battery-tracked parts of a period, so a drop is only shared over the time it was measured. */
+    void attachTracked(Seg target, List<Seg> parts) {
+        Stats t = new Stats();
+        long ms = 0;
+        for (Seg p : parts) {
+            if (p.used < 0) continue;
+            merge(t, p.st != null && (p.st.on + p.st.off) > 0 ? p.st : compute(p.from, p.to));
+            ms += p.to - p.from;
+        }
+        target.tracked = t;
+        target.trackedMs = ms;
     }
 
     static void temps(Seg s, JSONArray samples) throws Exception {
@@ -929,10 +953,16 @@ public class MainActivity extends Activity {
         statCell(row, "Screen off", fmt(s.st.off), DBLUE);
         statCell(row, "Battery used", bat, GREEN);
         parent.addView(row);
-        if (s.used > 0) {
-            String per = "1% battery ≈ " + fmtS(s.st.on / s.used) + " of screen-on time  ·  ≈ "
-                    + fmtS((s.to - s.from) / s.used) + " of total time";
+        long trOn = s.tracked != null ? s.tracked.on : s.st.on;
+        long trSpan = s.trackedMs >= 0 ? s.trackedMs : s.to - s.from;
+        if (s.used >= 2) {
+            String per = "1% battery ≈ " + fmtS(trOn / s.used) + " of screen-on time  ·  ≈ "
+                    + fmtS(trSpan / s.used) + " of total time";
             TextView t = text(parent, per, 13, TXT, false);
+            t.setPadding(0, dp(4), 0, dp(2));
+        } else {
+            TextView t = text(parent, s.used == 1 ? "Only 1% drop measured so far — \"1% ≈\" figures appear once at least 2–3% has been measured."
+                    : "No battery drop measured for this period yet — the \"1% ≈\" figures appear once the battery has dropped a few % while this app was tracking.", 12, SUB, false);
             t.setPadding(0, dp(4), 0, dp(2));
         }
         tempRow(parent, "CPU temp", s.cpu, 0xFFF97316);
@@ -997,7 +1027,7 @@ public class MainActivity extends Activity {
         final int FIRST = 15;
         for (int i = 0; i < Math.min(FIRST, shown.size()); i++) {
             String k = shown.get(i).getKey();
-            appRow(c, k, s.st.apps.getOrDefault(k, 0L), s.st.bg.getOrDefault(k, 0L), shown.get(i).getValue(), tot, s.used);
+            appRow(c, k, s.st.apps.getOrDefault(k, 0L), s.st.bg.getOrDefault(k, 0L), shown.get(i).getValue(), tot, s);
         }
         if (shown.size() > FIRST) {
             TextView more = new TextView(this);
@@ -1010,7 +1040,7 @@ public class MainActivity extends Activity {
                 c.removeView(more);
                 for (int i = FIRST; i < shown.size(); i++) {
                     String k = shown.get(i).getKey();
-                    appRow(c, k, s.st.apps.getOrDefault(k, 0L), s.st.bg.getOrDefault(k, 0L), shown.get(i).getValue(), tot, s.used);
+                    appRow(c, k, s.st.apps.getOrDefault(k, 0L), s.st.bg.getOrDefault(k, 0L), shown.get(i).getValue(), tot, s);
                     View row = c.getChildAt(c.getChildCount() - 1);
                     row.setAlpha(0f);
                     row.animate().alpha(1f).setStartDelay(Math.min(12, i - FIRST) * 18L).setDuration(200).start();
@@ -1021,7 +1051,14 @@ public class MainActivity extends Activity {
         if (shown.isEmpty()) text(c, "No app usage recorded.", 14, SUB, false);
     }
 
-    void appRow(LinearLayout parent, String pkg, long ms, long bgMs, double w, double total, int used) {
+    void appRow(LinearLayout parent, String pkg, long ms, long bgMs, double w, double total, Seg seg) {
+        int used = seg.used;
+        Stats tr = seg.tracked != null ? seg.tracked : seg.st;
+        double trTotal = 0;
+        for (long v : tr.apps.values()) trTotal += v;
+        for (long v : tr.bg.values()) trTotal += v * BG_WEIGHT;
+        long trMs = tr.apps.getOrDefault(pkg, 0L), trBg = tr.bg.getOrDefault(pkg, 0L);
+        double trW = trMs + trBg * BG_WEIGHT;
         LinearLayout row = new LinearLayout(this);
         row.setGravity(Gravity.CENTER_VERTICAL);
         row.setPadding(0, dp(10), 0, dp(10));
@@ -1046,15 +1083,17 @@ public class MainActivity extends Activity {
         String time = ms > 0 ? fmt(ms) + " on screen" : "";
         if (bgMs >= 60000) time += (time.isEmpty() ? "" : " · ") + fmt(bgMs) + " background";
         if (time.isEmpty()) time = "<1 min";
-        double share = total > 0 ? 100.0 * w / total : 0;
+        double share = total > 0 ? 100.0 * w / total : 0;   // share of all usage in the period
         TextView info = new TextView(this);
         info.setText(time);
         info.setTextSize(13);
         info.setTextColor(SUB);
         TextView info2 = new TextView(this);
         String l2 = String.format(Locale.US, "%.1f%% of the battery drain", share);
-        double appPct = used >= 0 && total > 0 ? used * w / total : -1;
-        if (appPct >= 0.05) l2 += "  ·  1% ≈ " + fmtS((long) ((ms + bgMs) / appPct)) + " of use";
+        // battery this app used = (its share of the usage while the drop was measured) x (that drop)
+        double appPct = used > 0 && trTotal > 0 ? used * trW / trTotal : -1;
+        // "1% ≈ X" only when the measurement is big enough to be meaningful: >= 3% drop overall and >= 0.5% for this app
+        if (used >= 3 && appPct >= 0.5) l2 += "  ·  1% ≈ " + fmtS((long) ((trMs + trBg) / appPct)) + " of use";
         info2.setText(l2);
         info2.setTextSize(12);
         info2.setTextColor(SUB);
@@ -1067,14 +1106,15 @@ public class MainActivity extends Activity {
         rc.setOrientation(LinearLayout.VERTICAL);
         rc.setGravity(Gravity.END);
         TextView big = new TextView(this);
-        big.setText(appPct >= 0 ? String.format(Locale.US, appPct < 10 ? "%.1f%%" : "%.0f%%", appPct)
+        boolean notMeasured = appPct == 0 && trW == 0;      // used only while charging / before tracking began
+        big.setText(notMeasured ? "—" : appPct >= 0 ? String.format(Locale.US, appPct < 10 ? "%.1f%%" : "%.0f%%", appPct)
                 : String.format(Locale.US, "%.0f%%", share));
         big.setTextSize(18);
         big.setTextColor(TXT);
         big.setTypeface(Typeface.DEFAULT_BOLD);
         big.setGravity(Gravity.END);
         TextView unit = new TextView(this);
-        unit.setText(appPct >= 0 ? "of battery" : "of use");
+        unit.setText(notMeasured ? "not measured" : appPct >= 0 ? "of battery" : "of use");
         unit.setTextSize(11);
         unit.setTextColor(SUB);
         unit.setGravity(Gravity.END);
