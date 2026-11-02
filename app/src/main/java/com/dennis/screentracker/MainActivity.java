@@ -213,6 +213,14 @@ public class MainActivity extends Activity {
 
     interface OnPick { void pick(int i); }
 
+    BarChart hourChart, weekChart;
+    HourChart lvlChart, stackChart;
+
+    static <T extends View> T detach(T v) {
+        if (v.getParent() instanceof android.view.ViewGroup) ((android.view.ViewGroup) v.getParent()).removeView(v);
+        return v;
+    }
+
     LinearLayout root;
     int tab = 0, selDay = 6, selHour = 23;
     boolean loading, reload, chargingNow;
@@ -232,10 +240,24 @@ public class MainActivity extends Activity {
         super.onCreate(b);
         ScrollView sv = new ScrollView(this);
         sv.setBackgroundColor(BG);
-        root = new LinearLayout(this);
+        sv.setClipChildren(false);
+        page = new LinearLayout(this);
+        page.setOrientation(LinearLayout.VERTICAL);
+        page.setPadding(dp(16), dp(48), dp(16), dp(56));
+        page.setClipChildren(false);
+        sv.addView(page);
+        TextView t = new TextView(this);
+        t.setText("Battery");
+        t.setTextSize(26);
+        t.setTextColor(TXT);
+        t.setTypeface(Typeface.DEFAULT_BOLD);
+        t.setPadding(dp(4), 0, 0, dp(14));
+        page.addView(t);
+        buildTabs();
+        root = new LinearLayout(this);          // everything below the tabs; rebuilt on data changes
         root.setOrientation(LinearLayout.VERTICAL);
-        root.setPadding(dp(16), dp(48), dp(16), dp(56));
-        sv.addView(root);
+        root.setClipChildren(false);
+        page.addView(root, new LinearLayout.LayoutParams(-1, -2));
         setContentView(sv);
         ChargeWatchJob.schedule(this);
     }
@@ -243,7 +265,8 @@ public class MainActivity extends Activity {
     @Override protected void onResume() {
         super.onResume();
         if (!hasUsageAccess()) { buildNoAccess(); return; }
-        if (root.getChildCount() == 0) { title("Battery"); text(root, "Loading…", 14, SUB, false); }
+        tabFrame.setVisibility(View.VISIBLE);
+        if (root.getChildCount() == 0) text(root, "Loading…", 14, SUB, false);
         load();
     }
 
@@ -253,12 +276,18 @@ public class MainActivity extends Activity {
                 android.os.Process.myUid(), getPackageName()) == AppOpsManager.MODE_ALLOWED;
     }
 
-    void load() {
+    void load() { load(-1); }
+
+    /** onlyTab = -1 computes all three tabs (so switching tabs is instant); otherwise just that tab. */
+    void load(int onlyTab) {
         if (loading) { reload = true; return; }
         loading = true;
-        final int t = tab, d = selDay, hsel = selHour;
+        final int d = selDay, hsel = selHour;
         new Thread(() -> {
-            try { computeModel(t, d, hsel); } catch (Exception ignored) { }
+            for (int t = 0; t < 3; t++) {
+                if (onlyTab >= 0 && t != onlyTab) continue;
+                try { computeModel(t, d, hsel); } catch (Exception ignored) { }
+            }
             runOnUiThread(() -> {
                 loading = false;
                 if (reload) { reload = false; load(); return; }
@@ -360,9 +389,9 @@ public class MainActivity extends Activity {
 
         final Seg fc0 = c0, fdone = done, ftotal = total;
         runOnUiThread(() -> {
-            cur = fc0; lastDone = fdone; dayTotal = ftotal;
-            chartPts = pts; dayStarts = starts; daySegs = segs;
-            if (t == 2) dayOn = on;
+            cur = fc0; lastDone = fdone; dayStarts = starts;
+            if (t == 0) chartPts = pts;
+            if (t == 2) { dayTotal = ftotal; daySegs = segs; dayOn = on; }
         });
     }
 
@@ -513,7 +542,7 @@ public class MainActivity extends Activity {
     // ================= UI =================
     void buildNoAccess() {
         root.removeAllViews();
-        title("Battery");
+        tabFrame.setVisibility(View.GONE);
         LinearLayout c = card(root);
         text(c, "This app needs \"Usage access\" to read screen and app activity.\n\nTap the button, find this app, and turn it on. "
                 + "If it says the setting is restricted: Settings > Apps > this app > ⋮ > Allow restricted settings.", 15, TXT, false);
@@ -523,8 +552,7 @@ public class MainActivity extends Activity {
     void build() {
         if (!hasUsageAccess()) { buildNoAccess(); return; }
         root.removeAllViews();
-        title("Battery");
-        tabs();
+        tabFrame.setVisibility(View.VISIBLE);
         if (tab == 0) buildSince(); else if (tab == 1) buildHours(); else buildWeek();
         LinearLayout f = card(root);
         button(f, "Refresh", v -> load());
@@ -534,26 +562,70 @@ public class MainActivity extends Activity {
                 + "battery use, so the cycle's battery drop is split by each app's on-screen time plus 30% weight for background (foreground-service) time. Includes system apps. Pure background work without a notification (e.g. cell standby) can't be seen by apps.", 12, SUB, false);
     }
 
-    void tabs() {
-        LinearLayout bar = new LinearLayout(this);
-        bar.setBackground(round(CARD, 24));
-        bar.setPadding(dp(4), dp(4), dp(4), dp(4));
+    LinearLayout page;
+    android.widget.FrameLayout tabFrame;
+    View tabPill;
+    TextView[] tabLabels;
+    static final android.view.animation.Interpolator EASE = new android.view.animation.PathInterpolator(0.2f, 0f, 0f, 1f);
+
+    /** Tab bar with a highlight that slides between tabs (built once, never rebuilt). */
+    void buildTabs() {
+        tabFrame = new android.widget.FrameLayout(this);
+        tabFrame.setBackground(round(CARD, 26));
+        tabFrame.setPadding(dp(4), dp(4), dp(4), dp(4));
+        tabPill = new View(this);
+        tabPill.setBackground(round(SEL, 22));
+        tabFrame.addView(tabPill, new android.widget.FrameLayout.LayoutParams(0, -1));
+        LinearLayout row = new LinearLayout(this);
         String[] names = {"Since charge", "24 hours", "7 days"};
+        tabLabels = new TextView[names.length];
         for (int i = 0; i < names.length; i++) {
             final int idx = i;
             TextView t = new TextView(this);
             t.setText(names[i]);
             t.setTextSize(15);
             t.setGravity(Gravity.CENTER);
-            t.setPadding(0, dp(10), 0, dp(10));
+            t.setPadding(0, dp(11), 0, dp(11));
             t.setTextColor(i == tab ? TXT : SUB);
-            if (i == tab) t.setBackground(round(SEL, 20));
-            t.setOnClickListener(v -> { if (tab != idx) { tab = idx; load(); } });
-            bar.addView(t, new LinearLayout.LayoutParams(0, -2, 1));
+            t.setOnClickListener(v -> switchTab(idx));
+            tabLabels[i] = t;
+            row.addView(t, new LinearLayout.LayoutParams(0, -2, 1));
         }
+        tabFrame.addView(row, new android.widget.FrameLayout.LayoutParams(-1, -2));
+        tabFrame.addOnLayoutChangeListener((v, l, t, r, bt, ol, ot, or, ob) -> {
+            int w = (r - l - dp(8)) / tabLabels.length;
+            android.view.ViewGroup.LayoutParams p = tabPill.getLayoutParams();
+            if (p.width != w) { p.width = w; tabPill.setLayoutParams(p); }
+            tabPill.setTranslationX(tab * w);
+        });
         LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(-1, -2);
         lp.bottomMargin = dp(12);
-        root.addView(bar, lp);
+        page.addView(tabFrame, lp);
+    }
+
+    void switchTab(int idx) {
+        if (idx == tab) return;
+        int old = tab;
+        tab = idx;
+        int w = tabPill.getWidth();
+        tabPill.animate().translationX(idx * w).setDuration(320).setInterpolator(EASE).start();
+        for (int i = 0; i < tabLabels.length; i++) {
+            final TextView t = tabLabels[i];
+            int from = t.getCurrentTextColor(), to = i == idx ? TXT : SUB;
+            if (from == to) continue;
+            android.animation.ValueAnimator va = android.animation.ValueAnimator.ofArgb(from, to);
+            va.setDuration(260);
+            va.addUpdateListener(a -> t.setTextColor((int) a.getAnimatedValue()));
+            va.start();
+        }
+        // content: quick fade out, swap (data is preloaded), fade + slide in
+        final float dir = idx > old ? 1 : -1;
+        root.animate().cancel();
+        root.animate().alpha(0f).translationX(-dir * dp(24)).setDuration(110).setInterpolator(EASE).withEndAction(() -> {
+            build();
+            root.setTranslationX(dir * dp(24));
+            root.animate().alpha(1f).translationX(0).setDuration(280).setInterpolator(EASE).start();
+        }).start();
     }
 
     void buildSince() {
@@ -604,18 +676,34 @@ public class MainActivity extends Activity {
         }
         // Battery level per hour
         LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(-1, dp(170));
-        c.addView(new HourChart(this, slots, labels, sinceLvl, null, null), lp);
+        String[] rng = new String[sinceOn.length], lv = new String[sinceOn.length], onv = new String[sinceOn.length], offr = new String[sinceOn.length];
+        SimpleDateFormat hf2 = new SimpleDateFormat("HH:mm", Locale.US);
+        for (int i = 0; i < sinceOn.length; i++) {
+            long a0 = Math.max(sinceStarts[i], s.from), a1 = i == sinceOn.length - 1 ? -1 : sinceStarts[i] + 3600000L;
+            rng[i] = hf2.format(new Date(a0)) + "–" + (a1 < 0 ? "now" : hf2.format(new Date(a1)));
+            lv[i] = i < sinceLvl.length && sinceLvl[i] >= 0 ? sinceLvl[i] + "%" : "—";
+            onv[i] = fmtHM(sinceOn[i]) + " on";
+            offr[i] = rng[i] + "  ·  " + fmtHM(sinceOff[i]) + " off";
+        }
+        if (lvlChart == null) lvlChart = new HourChart(this);
+        lvlChart.setData(slots, labels, sinceLvl, null, null, lv, rng);
+        lvlChart.dimViews = new View[]{h, sub};
+        c.addView(detach(lvlChart), lp);
 
         // Big totals
         LinearLayout tot = new LinearLayout(this);
         tot.setPadding(0, dp(22), 0, dp(4));
-        tot.addView(bigStat(s.st.on, "Screen on", BLUE, false), new LinearLayout.LayoutParams(0, -2, 1));
+        View bOn = bigStat(s.st.on, "Screen on", BLUE, false);
+        tot.addView(bOn, new LinearLayout.LayoutParams(0, -2, 1));
         tot.addView(bigStat(s.st.off, "Screen off", LBLUE, true), new LinearLayout.LayoutParams(0, -2, 1));
         c.addView(tot);
         // Screen on / off per hour, stacked
         LinearLayout.LayoutParams lp2 = new LinearLayout.LayoutParams(-1, dp(170));
         lp2.topMargin = dp(10);
-        c.addView(new HourChart(this, slots, labels, null, sinceOn, sinceOff), lp2);
+        if (stackChart == null) stackChart = new HourChart(this);
+        stackChart.setData(slots, labels, null, sinceOn, sinceOff, onv, offr);
+        stackChart.dimViews = new View[]{tot};
+        c.addView(detach(stackChart), lp2);
 
         // Extra detail the phone's own page doesn't give
         View div = new View(this);
@@ -668,7 +756,7 @@ public class MainActivity extends Activity {
     void buildHours() {
         if (hourSeg == null) return;
         LinearLayout c = card(root);
-        text(c, "Screen on per hour — tap an hour", 13, SUB, false);
+        TextView hint = text(c, "Screen on per hour — tap or slide along the bars", 13, SUB, false);
         String[] labels = new String[24];
         SimpleDateFormat f = new SimpleDateFormat("HH", Locale.US);
         for (int i = 0; i < 24; i++) {
@@ -677,12 +765,17 @@ public class MainActivity extends Activity {
             labels[i] = i == 23 ? "Now" : (k.get(Calendar.HOUR_OF_DAY) % 4 == 0 && i <= 20 ? f.format(new Date(hourStarts[i])) : "");
         }
         LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(-1, dp(190));
-        lp.topMargin = dp(8);
-        String[] tips = new String[24];
+        lp.topMargin = dp(44);   // room for the value card above the bars
+        String[] tips = new String[24], vals = new String[24];
         SimpleDateFormat tf = new SimpleDateFormat("HH:mm", Locale.US);
-        for (int i = 0; i < 24; i++)
+        for (int i = 0; i < 24; i++) {
             tips[i] = tf.format(new Date(hourStarts[i])) + "–" + (i == 23 ? "now" : tf.format(new Date(hourStarts[i + 1])));
-        c.addView(new BarChart(this, hourOn, labels, tips, selHour, 3600000L, i -> { selHour = i; load(); }), lp);
+            vals[i] = fmtHM(hourOn[i]);
+        }
+        if (hourChart == null) hourChart = new BarChart(this, i -> { selHour = i; load(1); });
+        hourChart.setData(hourOn, labels, vals, tips, selHour, 3600000L);
+        hourChart.dimViews = new View[]{hint};
+        c.addView(detach(hourChart), lp);
         SimpleDateFormat hf = new SimpleDateFormat("HH:mm", Locale.US);
         String range = hf.format(new Date(hourStarts[selHour])) + "–" + (selHour == 23 ? "now" : hf.format(new Date(hourStarts[selHour + 1])));
         text(c, range, 18, TXT, true).setPadding(0, dp(14), 0, 0);
@@ -693,19 +786,24 @@ public class MainActivity extends Activity {
     void buildWeek() {
         if (dayTotal == null) return;
         LinearLayout c = card(root);
-        text(c, "Screen on per day — tap a day", 13, SUB, false);
+        TextView hint = text(c, "Screen on per day — tap or slide along the bars", 13, SUB, false);
         String[] labels = new String[7];
         SimpleDateFormat f = new SimpleDateFormat("d/M", Locale.getDefault());
         for (int i = 0; i < 7; i++) labels[i] = i == 6 ? "Today" : f.format(new Date(dayStarts[i]));
         LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(-1, dp(190));
-        lp.topMargin = dp(8);
+        lp.topMargin = dp(44);   // room for the value card above the bars
         String[] tips = new String[7];
         SimpleDateFormat df = new SimpleDateFormat("EEE d MMM", Locale.getDefault());
         long mx = 0;
         for (int i = 0; i < 7; i++) { tips[i] = df.format(new Date(dayStarts[i])); mx = Math.max(mx, dayOn[i]); }
         long hrs = Math.max(2, (mx + 3599999) / 3600000);
         if (hrs % 2 == 1) hrs++;                       // even number of hours so the middle line is whole
-        c.addView(new BarChart(this, dayOn, labels, tips, selDay, hrs * 3600000L, i -> { selDay = i; load(); }), lp);
+        String[] vals = new String[7];
+        for (int i = 0; i < 7; i++) vals[i] = fmtHM(dayOn[i]);
+        if (weekChart == null) weekChart = new BarChart(this, i -> { selDay = i; load(2); });
+        weekChart.setData(dayOn, labels, vals, tips, selDay, hrs * 3600000L);
+        weekChart.dimViews = new View[]{hint};
+        c.addView(detach(weekChart), lp);
         String day = selDay == 6 ? "Today" : new SimpleDateFormat("EEEE, d MMM", Locale.getDefault()).format(new Date(dayStarts[selDay]));
         text(c, day, 18, TXT, true).setPadding(0, dp(14), 0, 0);
         statsRow(c, dayTotal);
@@ -894,6 +992,8 @@ public class MainActivity extends Activity {
         c.setOrientation(LinearLayout.VERTICAL);
         c.setBackground(round(CARD, 18));
         c.setPadding(dp(16), dp(16), dp(16), dp(16));
+        c.setClipChildren(false);
+        c.setClipToPadding(false);
         LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(-1, -2);
         lp.bottomMargin = dp(12);
         parent.addView(c, lp);
@@ -1037,164 +1137,249 @@ public class MainActivity extends Activity {
         }
     }
 
-    /** Per-hour chart like the phone's Battery page. Either battery level per hour (lvl, 0-100%)
-     *  or stacked screen-on / screen-off minutes per hour (on/off, 0-60 min). Empty slots on the
-     *  right are kept so the bars don't stretch. */
-    static class HourChart extends View {
-        final int slots;
-        final String[] labels;
-        final int[] lvl;
-        final long[] on, off;
-        final Paint bar = new Paint(Paint.ANTI_ALIAS_FLAG), txt = new Paint(Paint.ANTI_ALIAS_FLAG), grid = new Paint();
+    /** Shared touch + value-card behaviour for both chart types, styled like the phone's Battery page:
+     *  press or slide along the bars, the touched bar is highlighted and a rounded card with a big
+     *  value and its time range follows the finger, joined to the bar by a thin line. */
+    static abstract class TouchChart extends View {
         final float d;
+        final Paint txt = new Paint(Paint.ANTI_ALIAS_FLAG), grid = new Paint(Paint.ANTI_ALIAS_FLAG),
+                bar = new Paint(Paint.ANTI_ALIAS_FLAG), cardP = new Paint(Paint.ANTI_ALIAS_FLAG),
+                big = new Paint(Paint.ANTI_ALIAS_FLAG), small = new Paint(Paint.ANTI_ALIAS_FLAG), line = new Paint(Paint.ANTI_ALIAS_FLAG);
+        String[] labels = new String[0], tipVal = new String[0], tipRange = new String[0];
+        int slots = 1, sel = -1;
+        float tipAlpha = 0f, focus = 0f, tipX = -1;        // animated
+        boolean persistent;                                // keep a selection after the finger lifts
+        android.animation.ValueAnimator aTip, aFocus, aX;
+        float downX, downY;
+        boolean dragging;
+        final int slop;
+        final Runnable hide = () -> fadeTip(0f);
+        View[] dimViews = new View[0];               // text the card floats over; dimmed while it shows
 
-        HourChart(Context c, int slots, String[] labels, int[] lvl, long[] on, long[] off) {
+        TouchChart(Context c) {
             super(c);
-            this.slots = slots; this.labels = labels; this.lvl = lvl; this.on = on; this.off = off;
             d = c.getResources().getDisplayMetrics().density;
-            txt.setTextSize(13 * d);
+            slop = android.view.ViewConfiguration.get(c).getScaledTouchSlop();
+            txt.setTextSize(12.5f * d);
+            txt.setColor(SUB);
             grid.setColor(0xFF3A3A3C);
             grid.setStrokeWidth(d);
+            cardP.setColor(0xF2343438);
+            cardP.setShadowLayer(14 * d, 0, 4 * d, 0x80000000);
+            big.setColor(TXT);
+            big.setTextSize(27 * d);
+            big.setTypeface(Typeface.DEFAULT_BOLD);
+            small.setColor(0xFFD1D1D6);
+            small.setTextSize(15 * d);
+            line.setColor(0x99FFFFFF);
+            line.setStrokeWidth(d);
         }
 
-        @Override protected void onDraw(Canvas cv) {
-            float w = getWidth(), h = getHeight();
-            float right = w - 66 * d, top = 10 * d, bottom = h - 26 * d;
-            float slot = right / slots, bw = Math.min(slot * 0.62f, 16 * d);
-            boolean level = lvl != null;
-            txt.setColor(SUB);
-            String[] ax = level ? new String[]{"0%", "50%", "100%"} : new String[]{"0 min", "30 min", "60 min"};
+        float right() { return getWidth() - 62 * d; }
+        float slotW() { return right() / slots; }
+        float cx(int i) { return i * slotW() + slotW() / 2; }
+        abstract int count();
+        abstract float barTop(int i);                      // y of the top of bar i
+
+        void anim(android.animation.ValueAnimator old, float from, float to, long ms, java.util.function.Consumer<Float> set, int which) {
+            if (old != null) old.cancel();
+            android.animation.ValueAnimator va = android.animation.ValueAnimator.ofFloat(from, to);
+            va.setDuration(ms);
+            va.setInterpolator(EASE);
+            va.addUpdateListener(a -> { set.accept((float) a.getAnimatedValue()); invalidate(); });
+            va.start();
+            if (which == 0) {
+                aTip = va;
+                va.addUpdateListener(a -> { for (View dv : dimViews) if (dv != null) dv.setAlpha(1f - 0.75f * tipAlpha); });
+            } else if (which == 1) aFocus = va; else aX = va;
+        }
+        void fadeTip(float to) {
+            anim(aTip, tipAlpha, to, to > 0 ? 160 : 260, v -> tipAlpha = v, 0);
+            if (!persistent) anim(aFocus, focus, to, to > 0 ? 160 : 300, v -> focus = v, 1);
+        }
+        void select(int i, boolean animate) {
+            i = Math.max(0, Math.min(count() - 1, i));
+            if (i == sel && tipX >= 0) return;
+            sel = i;
+            float target = cx(i);
+            if (!animate || tipX < 0) { tipX = target; invalidate(); }
+            else anim(aX, tipX, target, 140, v -> tipX = v, 2);
+            performHapticFeedback(android.view.HapticFeedbackConstants.CLOCK_TICK);
+        }
+        int indexAt(float x) { return (int) (x / slotW()); }
+
+        @Override public boolean onTouchEvent(MotionEvent e) {
+            if (count() == 0) return false;
+            switch (e.getActionMasked()) {
+                case MotionEvent.ACTION_DOWN:
+                    removeCallbacks(hide);
+                    downX = e.getX(); downY = e.getY(); dragging = false;
+                    if (tipX < 0 && sel >= 0) tipX = cx(sel);
+                    select(indexAt(e.getX()), true);
+                    fadeTip(1f);
+                    return true;
+                case MotionEvent.ACTION_MOVE:
+                    if (!dragging && Math.abs(e.getX() - downX) > slop && Math.abs(e.getX() - downX) > Math.abs(e.getY() - downY)) {
+                        dragging = true;
+                        getParent().requestDisallowInterceptTouchEvent(true);   // horizontal slide = scrub, not scroll
+                    }
+                    if (dragging) select(indexAt(e.getX()), true);
+                    return true;
+                case MotionEvent.ACTION_UP:
+                    performClick();
+                    onPicked(sel);
+                    postDelayed(hide, 1400);
+                    return true;
+                case MotionEvent.ACTION_CANCEL:
+                    postDelayed(hide, 200);
+                    return true;
+            }
+            return true;
+        }
+        void onPicked(int i) { }
+        @Override public boolean performClick() { return super.performClick(); }
+
+        static int mix(int a, int b, float t) {
+            return android.graphics.Color.argb(255,
+                    (int) (((a >> 16) & 255) + (((b >> 16) & 255) - ((a >> 16) & 255)) * t),
+                    (int) (((a >> 8) & 255) + (((b >> 8) & 255) - ((a >> 8) & 255)) * t),
+                    (int) ((a & 255) + ((b & 255) - (a & 255)) * t));
+        }
+
+        void drawAxis(Canvas cv, String[] ax, float top, float bottom) {
+            float w = getWidth();
             for (int k = 0; k <= 2; k++) {
                 float y = bottom - (bottom - top) * k / 2f;
-                cv.drawLine(0, y, right, y, grid);
-                cv.drawText(ax[k], w - txt.measureText(ax[k]), y + 5 * d, txt);
+                cv.drawLine(0, y, right(), y, grid);
+                cv.drawText(ax[k], w - txt.measureText(ax[k]), y + 4.5f * d, txt);
             }
-            int n = level ? lvl.length : on.length;
-            float r = 3 * d;
-            for (int i = 0; i < n; i++) {
-                float cx = i * slot + slot / 2, l = cx - bw / 2, rr = cx + bw / 2;
-                if (level) {
-                    if (lvl[i] < 0) continue;
-                    float y = bottom - (bottom - top) * lvl[i] / 100f;
-                    bar.setShader(new android.graphics.LinearGradient(0, y, 0, bottom, BLUE, 0xFF6EC1F5, android.graphics.Shader.TileMode.CLAMP));
-                    cv.drawRoundRect(new RectF(l, y, rr, bottom), r, r, bar);
-                    bar.setShader(null);
-                } else {
-                    float yOn = bottom - (bottom - top) * Math.min(1f, on[i] / 3600000f);
-                    float yOff = yOn - (bottom - top) * Math.min(1f, off[i] / 3600000f);
-                    yOff = Math.max(top, yOff);
-                    if (off[i] > 0) { bar.setColor(LBLUE); cv.drawRoundRect(new RectF(l, yOff, rr, yOn + r), r, r, bar); }
-                    if (on[i] > 0) { bar.setColor(BLUE); cv.drawRoundRect(new RectF(l, yOn, rr, bottom), r, r, bar);
-                        if (off[i] > 0) cv.drawRect(l, yOn, rr, yOn + r, bar); }
-                }
-            }
-            // labels, right-to-left, skipping any that would touch
-            float nextLeft = Float.MAX_VALUE;
+        }
+        void drawLabels(Canvas cv) {
+            float h = getHeight(), slot = slotW(), nextLeft = Float.MAX_VALUE;
             for (int i = slots - 1; i >= 0; i--) {
-                if (labels[i] == null || labels[i].isEmpty()) continue;
+                if (i >= labels.length || labels[i] == null || labels[i].isEmpty()) continue;
                 float lw = txt.measureText(labels[i]);
-                float lx = Math.max(0, Math.min(right - lw, i * slot + (slot - lw) / 2));
+                float lx = Math.max(0, Math.min(right() - lw, i * slot + (slot - lw) / 2));
                 if (lx + lw + 8 * d > nextLeft) continue;
                 cv.drawText(labels[i], lx, h - 5 * d, txt);
                 nextLeft = lx;
             }
         }
+        /** Value card above the chart (it may float over the text above it), thin line + dot down to the bar. */
+        void drawTip(Canvas cv, float plotTop) {
+            if (tipAlpha <= 0.01f || sel < 0 || sel >= tipVal.length) return;
+            int al = (int) (255 * tipAlpha);
+            String v = tipVal[sel], r = sel < tipRange.length ? tipRange[sel] : "";
+            float pad = 14 * d, cw = Math.max(big.measureText(v), small.measureText(r)) + 2 * pad, ch = 74 * d;
+            float lift = (1 - tipAlpha) * 6 * d;
+            float cardBottom = plotTop - 10 * d + lift;
+            float bx = Math.max(-4 * d, Math.min(right() - cw + 4 * d, tipX - cw / 2));
+            RectF rc = new RectF(bx, cardBottom - ch, bx + cw, cardBottom);
+            float by = barTop(sel);
+            line.setAlpha((int) (150 * tipAlpha));
+            cv.drawLine(tipX, cardBottom, tipX, by - 3 * d, line);
+            Paint dot = new Paint(Paint.ANTI_ALIAS_FLAG);
+            dot.setColor(BLUE); dot.setAlpha(al);
+            cv.drawCircle(tipX, by - 3 * d, 3.2f * d, dot);
+            cardP.setAlpha((int) (242 * tipAlpha));
+            cv.drawRoundRect(rc, 14 * d, 14 * d, cardP);
+            big.setAlpha(al); small.setAlpha(al);
+            cv.drawText(v, rc.left + pad, rc.top + 34 * d, big);
+            cv.drawText(r, rc.left + pad, rc.top + 60 * d, small);
+        }
     }
 
-    static class BarChart extends View {
-        final long[] v;
-        final String[] labels, tips;
-        final int sel;
-        final long axisMax;
+    /** Screen-on per hour/day (24 hours & 7 days tabs). Selection stays and drives the details below. */
+    static class BarChart extends TouchChart {
+        long[] v = new long[0];
+        long axisMax = 1;
         final OnPick cb;
-        final Paint bar = new Paint(Paint.ANTI_ALIAS_FLAG), txt = new Paint(Paint.ANTI_ALIAS_FLAG),
-                grid = new Paint(Paint.ANTI_ALIAS_FLAG), bubble = new Paint(Paint.ANTI_ALIAS_FLAG);
-        final float d;
-        static final float AXIS_W = 62, TIP_H = 30; // dp
+        int picked = -1;
 
-        /** Bar chart laid out like the phone's Battery page: thin rounded bars, dashed grid with
-         *  the scale on the right, a time label every few bars along the bottom, and a bubble
-         *  above the selected bar naming its time range. */
-        BarChart(Context c, long[] v, String[] labels, String[] tips, int sel, long axisMax, OnPick cb) {
-            super(c);
-            this.v = v; this.labels = labels; this.tips = tips; this.sel = sel; this.axisMax = axisMax; this.cb = cb;
-            d = c.getResources().getDisplayMetrics().density;
-            txt.setTextSize(12 * d);
-            grid.setColor(GREY);
-            grid.setStrokeWidth(d);
-            grid.setPathEffect(new android.graphics.DashPathEffect(new float[]{3 * d, 4 * d}, 0));
-            bubble.setColor(0xFF4A4A4E);
+        BarChart(Context c, OnPick cb) { super(c); this.cb = cb; persistent = true; focus = 1f; }
+
+        void setData(long[] v, String[] labels, String[] vals, String[] range, int sel, long axisMax) {
+            this.v = v; this.labels = labels; this.tipVal = vals; this.tipRange = range;
+            this.slots = v.length; this.axisMax = Math.max(1, axisMax);
+            if (this.sel != sel || tipX < 0) { this.sel = sel; tipX = -1; }
+            picked = sel;
+            invalidate();
         }
-
-        static String axis(long ms) {
-            return ms < 3600000L ? (ms / 60000) + " min" : (ms / 3600000L) + " h";
+        static String axis(long ms) { return ms < 3600000L ? (ms / 60000) + " min" : (ms / 3600000L) + " h"; }
+        float top() { return 14 * d; }
+        float bottom() { return getHeight() - 26 * d; }
+        @Override int count() { return v.length; }
+        @Override float barTop(int i) {
+            float bh = Math.min(1f, v[i] / (float) axisMax) * (bottom() - top());
+            return bottom() - Math.max(bh, v[i] > 0 ? 2 * d : 0);
         }
-
-        float slot() { return (getWidth() - AXIS_W * d) / v.length; }
+        @Override void onPicked(int i) { if (i != picked && cb != null) { picked = i; cb.pick(i); } }
 
         @Override protected void onDraw(Canvas cv) {
-            float w = getWidth(), h = getHeight();
-            float right = w - AXIS_W * d, top = (TIP_H + 12) * d, bottom = h - 24 * d;
-            float slot = slot();
-            // dashed grid + right-hand scale (top, middle, zero)
-            txt.setColor(SUB);
-            for (int k = 0; k <= 2; k++) {
-                float y = bottom - (bottom - top) * k / 2f;
-                cv.drawLine(0, y, right, y, grid);
-                String l = axis(axisMax * k / 2);
-                txt.setTextSize(11 * d);
-                cv.drawText(l, w - txt.measureText(l) - 2 * d, y + 4 * d, txt);
-                txt.setTextSize(12 * d);
-            }
-            // bars
-            float bw = Math.max(3 * d, Math.min(slot * 0.5f, 10 * d));
+            if (tipX < 0 && sel >= 0 && getWidth() > 0) tipX = cx(sel);
+            drawAxis(cv, new String[]{axis(0), axis(axisMax / 2), axis(axisMax)}, top(), bottom());
+            float slot = slotW(), bw = Math.max(3 * d, Math.min(slot * 0.5f, 12 * d));
             for (int i = 0; i < v.length; i++) {
-                float bh = Math.min(1f, v[i] / (float) Math.max(1, axisMax)) * (bottom - top);
-                if (v[i] > 0) bh = Math.max(bh, 2 * d);
-                float cx = i * slot + slot / 2;
+                float t = barTop(i), x = cx(i);
+                if (bottom() - t <= 0) continue;
                 bar.setColor(i == sel ? BLUE : GREY);
-                cv.drawRoundRect(new RectF(cx - bw / 2, bottom - bh, cx + bw / 2, bottom), bw / 2, bw / 2, bar);
+                cv.drawRoundRect(new RectF(x - bw / 2, t, x + bw / 2, bottom()), bw / 2, bw / 2, bar);
             }
-            // bottom labels, right-to-left so the last one ("Now"/"Today") always shows; skip any that would touch
-            float nextLeft = Float.MAX_VALUE;
-            for (int i = v.length - 1; i >= 0; i--) {
-                if (labels[i].isEmpty()) continue;
-                float lw = txt.measureText(labels[i]);
-                float lx = Math.max(0, Math.min(right - lw, i * slot + (slot - lw) / 2));
-                if (lx + lw + 8 * d > nextLeft) continue;
-                txt.setColor(SUB);
-                cv.drawText(labels[i], lx, h - 4 * d, txt);
-                nextLeft = lx;
-            }
-            // bubble above the selected bar
-            if (sel >= 0 && sel < v.length && tips != null) {
-                String t = tips[sel];
-                txt.setTextSize(12 * d);
-                float tw = txt.measureText(t) + 16 * d, th = 24 * d;
-                float cx = sel * slot + slot / 2;
-                float bx = Math.max(0, Math.min(right - tw, cx - tw / 2));
-                RectF r = new RectF(bx, 2 * d, bx + tw, 2 * d + th);
-                cv.drawRoundRect(r, 7 * d, 7 * d, bubble);
-                Path p = new Path();
-                p.moveTo(cx - 5 * d, r.bottom); p.lineTo(cx + 5 * d, r.bottom); p.lineTo(cx, r.bottom + 5 * d); p.close();
-                cv.drawPath(p, bubble);
-                txt.setColor(TXT);
-                cv.drawText(t, bx + 8 * d, r.top + 16.5f * d, txt);
-                // faint guide line from bubble to bar
-                Paint g = new Paint(grid); g.setPathEffect(null); g.setAlpha(60);
-                cv.drawLine(cx, r.bottom + 5 * d, cx, bottom, g);
-            }
+            drawLabels(cv);
+            drawTip(cv, top());
+        }
+    }
+
+    /** Since-charge charts: battery level per hour (lvl) or stacked screen on/off minutes (on/off).
+     *  Bars are all coloured; while touching, the touched bar stays coloured and the rest turn grey. */
+    static class HourChart extends TouchChart {
+        int[] lvl;
+        long[] on, off;
+
+        HourChart(Context c) { super(c); persistent = false; }
+
+        void setData(int slots, String[] labels, int[] lvl, long[] on, long[] off, String[] vals, String[] range) {
+            this.slots = slots; this.labels = labels; this.lvl = lvl; this.on = on; this.off = off;
+            this.tipVal = vals; this.tipRange = range;
+            if (sel >= count()) sel = -1;
+            invalidate();
+        }
+        float top() { return 10 * d; }
+        float bottom() { return getHeight() - 26 * d; }
+        @Override int count() { return lvl != null ? lvl.length : (on != null ? on.length : 0); }
+        @Override float barTop(int i) {
+            float H = bottom() - top();
+            if (lvl != null) return bottom() - H * Math.max(0, lvl[i]) / 100f;
+            return Math.max(top(), bottom() - H * Math.min(1f, (on[i] + off[i]) / 3600000f));
         }
 
-        @Override public boolean onTouchEvent(MotionEvent e) {
-            if (e.getAction() == MotionEvent.ACTION_UP) {
-                int i = (int) (e.getX() / slot());
-                if (i >= 0 && i < v.length && cb != null) cb.pick(i);
-                performClick();
+        @Override protected void onDraw(Canvas cv) {
+            boolean level = lvl != null;
+            drawAxis(cv, level ? new String[]{"0%", "50%", "100%"} : new String[]{"0 min", "30 min", "60 min"}, top(), bottom());
+            float slot = slotW(), bw = Math.min(slot * 0.5f, 12 * d), r = 3 * d, H = bottom() - top();
+            for (int i = 0; i < count(); i++) {
+                float x = cx(i), l = x - bw / 2, rr = x + bw / 2;
+                float g = i == sel ? 0f : focus;           // how grey this bar is
+                if (level) {
+                    if (lvl[i] < 0) continue;
+                    float y = barTop(i);
+                    bar.setShader(new android.graphics.LinearGradient(0, y, 0, bottom(), mix(BLUE, GREY, g), mix(0xFF6EC1F5, GREY, g),
+                            android.graphics.Shader.TileMode.CLAMP));
+                    cv.drawRoundRect(new RectF(l, y, rr, bottom()), r, r, bar);
+                    bar.setShader(null);
+                } else {
+                    float yOn = bottom() - H * Math.min(1f, on[i] / 3600000f);
+                    float yOff = Math.max(top(), yOn - H * Math.min(1f, off[i] / 3600000f));
+                    if (off[i] > 0) { bar.setColor(mix(LBLUE, 0xFF5A5A5E, g)); cv.drawRoundRect(new RectF(l, yOff, rr, yOn + r), r, r, bar); }
+                    if (on[i] > 0) {
+                        bar.setColor(mix(BLUE, GREY, g));
+                        cv.drawRoundRect(new RectF(l, yOn, rr, bottom()), r, r, bar);
+                        if (off[i] > 0) cv.drawRect(l, yOn, rr, yOn + r, bar);
+                    }
+                }
             }
-            return true;
+            drawLabels(cv);
+            drawTip(cv, top());
         }
-
-        @Override public boolean performClick() { return super.performClick(); }
     }
 }
