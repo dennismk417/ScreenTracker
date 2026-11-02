@@ -232,20 +232,22 @@ public class MainActivity extends Activity {
     int[] sinceLvl = new int[0];
     long[] dayOn = new long[7], dayStarts = new long[7], hourOn = new long[24], hourStarts = new long[25];
     Seg hourSeg;
-    final Map<String, Drawable> iconCache = new HashMap<>();
-    final Map<String, String> labelCache = new HashMap<>();
+    final Map<String, Drawable> iconCache = java.util.Collections.synchronizedMap(new HashMap<>());
+    final Map<String, String> labelCache = java.util.Collections.synchronizedMap(new HashMap<>());
 
     // ================= Lifecycle =================
+    ScrollView[] tabScroll = new ScrollView[3];
+    LinearLayout[] tabRoot = new LinearLayout[3];
+    int[] dataVer = new int[3], builtVer = {-1, -1, -1};
+    final java.util.concurrent.ExecutorService iconLoader = java.util.concurrent.Executors.newSingleThreadExecutor();
+
     @Override protected void onCreate(Bundle b) {
         super.onCreate(b);
-        ScrollView sv = new ScrollView(this);
-        sv.setBackgroundColor(BG);
-        sv.setClipChildren(false);
-        page = new LinearLayout(this);
+        page = new LinearLayout(this);              // fixed header: title + tabs
         page.setOrientation(LinearLayout.VERTICAL);
-        page.setPadding(dp(16), dp(48), dp(16), dp(56));
+        page.setBackgroundColor(BG);
+        page.setPadding(dp(16), dp(48), dp(16), 0);
         page.setClipChildren(false);
-        sv.addView(page);
         TextView t = new TextView(this);
         t.setText("Battery");
         t.setTextSize(26);
@@ -254,11 +256,24 @@ public class MainActivity extends Activity {
         t.setPadding(dp(4), 0, 0, dp(14));
         page.addView(t);
         buildTabs();
-        root = new LinearLayout(this);          // everything below the tabs; rebuilt on data changes
-        root.setOrientation(LinearLayout.VERTICAL);
-        root.setClipChildren(false);
-        page.addView(root, new LinearLayout.LayoutParams(-1, -2));
-        setContentView(sv);
+        android.widget.FrameLayout host = new android.widget.FrameLayout(this);
+        page.addView(host, new LinearLayout.LayoutParams(-1, 0, 1));
+        for (int i = 0; i < 3; i++) {             // each tab keeps its own page and scroll position
+            ScrollView sv = new ScrollView(this);
+            sv.setVerticalScrollBarEnabled(false);
+            sv.setClipChildren(false);
+            LinearLayout r = new LinearLayout(this);
+            r.setOrientation(LinearLayout.VERTICAL);
+            r.setClipChildren(false);
+            r.setPadding(0, 0, 0, dp(56));
+            sv.addView(r);
+            sv.setVisibility(i == tab ? View.VISIBLE : View.GONE);
+            host.addView(sv, new android.widget.FrameLayout.LayoutParams(-1, -1));
+            tabScroll[i] = sv;
+            tabRoot[i] = r;
+        }
+        root = tabRoot[tab];
+        setContentView(page);
         ChargeWatchJob.schedule(this);
     }
 
@@ -266,7 +281,7 @@ public class MainActivity extends Activity {
         super.onResume();
         if (!hasUsageAccess()) { buildNoAccess(); return; }
         tabFrame.setVisibility(View.VISIBLE);
-        if (root.getChildCount() == 0) text(root, "Loading…", 14, SUB, false);
+        if (tabRoot[tab].getChildCount() == 0) text(tabRoot[tab], "Loading…", 14, SUB, false);
         load();
     }
 
@@ -276,22 +291,41 @@ public class MainActivity extends Activity {
                 android.os.Process.myUid(), getPackageName()) == AppOpsManager.MODE_ALLOWED;
     }
 
+    int reloadTab = -1;
+    boolean reloadDetails;
+
     void load() { load(-1); }
 
     /** onlyTab = -1 computes all three tabs (so switching tabs is instant); otherwise just that tab. */
-    void load(int onlyTab) {
-        if (loading) { reload = true; return; }
+    void load(int onlyTab) { load(onlyTab, false); }
+
+    /** Computes in the background. Each tab is drawn as soon as its own numbers are ready, the visible tab
+     *  first (Since charge at launch). detailsOnly = a bar was picked: only the part below the chart changes. */
+    void load(int onlyTab, boolean detailsOnly) {
+        if (loading) {   // remember what to redo once the current run finishes
+            if (reload && !(reloadDetails && detailsOnly && reloadTab == onlyTab)) { reloadTab = -1; reloadDetails = false; }
+            else { reloadTab = onlyTab; reloadDetails = detailsOnly; }
+            reload = true;
+            return;
+        }
         loading = true;
-        final int d = selDay, hsel = selHour;
+        final int d = selDay, hsel = selHour, first = tab;
         new Thread(() -> {
-            for (int t = 0; t < 3; t++) {
+            int[] order = {first, (first + 1) % 3, (first + 2) % 3};
+            for (int t : order) {
                 if (onlyTab >= 0 && t != onlyTab) continue;
                 try { computeModel(t, d, hsel); } catch (Exception ignored) { }
+                final int tt = t;
+                runOnUiThread(() -> {
+                    dataVer[tt]++;
+                    if (detailsOnly && builtVer[tt] >= 0) { rebuildDetails(tt); builtVer[tt] = dataVer[tt]; }
+                    else if (tt == tab) buildTab(tt);
+                    else page.postDelayed(() -> { if (tt != tab && builtVer[tt] != dataVer[tt]) buildTab(tt); }, 600);
+                });
             }
             runOnUiThread(() -> {
                 loading = false;
-                if (reload) { reload = false; load(); return; }
-                build();
+                if (reload) { reload = false; load(reloadTab, reloadDetails); }
             });
         }).start();
     }
@@ -541,25 +575,55 @@ public class MainActivity extends Activity {
 
     // ================= UI =================
     void buildNoAccess() {
-        root.removeAllViews();
         tabFrame.setVisibility(View.GONE);
+        for (int i = 0; i < 3; i++) tabScroll[i].setVisibility(i == 0 ? View.VISIBLE : View.GONE);
+        tab = 0;
+        root = tabRoot[0];
+        root.removeAllViews();
+        builtVer[0] = -1;
         LinearLayout c = card(root);
         text(c, "This app needs \"Usage access\" to read screen and app activity.\n\nTap the button, find this app, and turn it on. "
                 + "If it says the setting is restricted: Settings > Apps > this app > ⋮ > Allow restricted settings.", 15, TXT, false);
         button(c, "Grant usage access", v -> startActivity(new Intent(Settings.ACTION_USAGE_ACCESS_SETTINGS)));
     }
 
-    void build() {
+    void build() { buildTab(tab); }
+
+    /** (Re)builds one tab's page. Doesn't touch which page is showing. */
+    void buildTab(int t) {
         if (!hasUsageAccess()) { buildNoAccess(); return; }
-        root.removeAllViews();
         tabFrame.setVisibility(View.VISIBLE);
-        if (tab == 0) buildSince(); else if (tab == 1) buildHours(); else buildWeek();
+        LinearLayout keep = root;
+        root = tabRoot[t];
+        root.removeAllViews();
+        if (dataVer[t] == 0) text(root, "Loading…", 14, SUB, false);
+        else if (t == 0) buildSince(); else if (t == 1) buildHours(); else buildWeek();
         LinearLayout f = card(root);
         button(f, "Refresh", v -> load());
         button(f, "Mark \"just unplugged\" now", v -> { ChargeWatchJob.markUnplugged(this); load(); });
-        text(f, "To save battery, the app only wakes up while charging (about every 15 min). Unplug time can be up to 15 min off; plug-in is detected within minutes. On battery, temperatures and the graph are sampled only when you open the app. Allow background activity for this app in "
+        text(f, "To save battery, the app only wakes up while charging. Unplug time and level are caught the moment you unplug; on battery, temperatures and the battery graph are sampled only when you open the app. Allow background activity for this app in "
                 + "Settings > Battery for best results. Per-app battery % is an estimate: Android doesn't let apps read real per-app "
-                + "battery use, so the cycle's battery drop is split by each app's on-screen time plus 30% weight for background (foreground-service) time. Includes system apps. Pure background work without a notification (e.g. cell standby) can't be seen by apps.", 12, SUB, false);
+                + "battery use, so the battery drop is split by each app's on-screen time plus 30% weight for background (foreground-service) time. Includes system apps. Pure background work without a notification (e.g. cell standby) can't be seen by apps.", 12, SUB, false);
+        builtVer[t] = dataVer[t];
+        root = tabRoot[tab];
+    }
+
+    /** Runs a builder with `root` pointed at another container. */
+    void into(LinearLayout box, Runnable r) {
+        LinearLayout keep = root;
+        root = box;
+        try { r.run(); } finally { root = keep; }
+    }
+
+    /** After a bar is picked: refill only the boxes under the chart and fade them in. */
+    void rebuildDetails(int t) {
+        LinearLayout a = t == 1 ? hourStatsBox : weekStatsBox, b = t == 1 ? hourAppsBox : weekAppsBox;
+        if (a == null || b == null) { buildTab(t); return; }
+        a.removeAllViews();
+        b.removeAllViews();
+        if (t == 1) { into(a, this::hourStats); into(b, this::hourApps); }
+        else { into(a, this::weekStats); into(b, this::weekApps); }
+        for (View v : new View[]{a, b}) { v.setAlpha(0.35f); v.animate().alpha(1f).setDuration(220).setInterpolator(EASE).start(); }
     }
 
     LinearLayout page;
@@ -618,13 +682,19 @@ public class MainActivity extends Activity {
             va.addUpdateListener(a -> t.setTextColor((int) a.getAnimatedValue()));
             va.start();
         }
-        // content: quick fade out, swap (data is preloaded), fade + slide in
+        // content: both pages are already built - cross-fade them (no rebuild, no blank frame)
+        if (builtVer[idx] != dataVer[idx]) buildTab(idx);
+        root = tabRoot[idx];
+        final ScrollView out = tabScroll[old], in = tabScroll[idx];
         final float dir = idx > old ? 1 : -1;
-        root.animate().cancel();
-        root.animate().alpha(0f).translationX(-dir * dp(24)).setDuration(110).setInterpolator(EASE).withEndAction(() -> {
-            build();
-            root.setTranslationX(dir * dp(24));
-            root.animate().alpha(1f).translationX(0).setDuration(280).setInterpolator(EASE).start();
+        out.animate().cancel();
+        in.animate().cancel();
+        in.setAlpha(0f);
+        in.setTranslationX(dir * dp(28));
+        in.setVisibility(View.VISIBLE);
+        in.animate().alpha(1f).translationX(0).setDuration(300).setInterpolator(EASE).start();
+        out.animate().alpha(0f).translationX(-dir * dp(28)).setDuration(220).setInterpolator(EASE).withEndAction(() -> {
+            if (tabScroll[tab] != out) { out.setVisibility(View.GONE); out.setAlpha(1f); out.setTranslationX(0); }
         }).start();
     }
 
@@ -772,16 +842,35 @@ public class MainActivity extends Activity {
             tips[i] = tf.format(new Date(hourStarts[i])) + "–" + (i == 23 ? "now" : tf.format(new Date(hourStarts[i + 1])));
             vals[i] = fmtHM(hourOn[i]);
         }
-        if (hourChart == null) hourChart = new BarChart(this, i -> { selHour = i; load(1); });
+        if (hourChart == null) hourChart = new BarChart(this, i -> { selHour = i; load(1, true); });
         hourChart.setData(hourOn, labels, vals, tips, selHour, 3600000L);
         hourChart.dimViews = new View[]{hint};
         c.addView(detach(hourChart), lp);
-        SimpleDateFormat hf = new SimpleDateFormat("HH:mm", Locale.US);
-        String range = hf.format(new Date(hourStarts[selHour])) + "–" + (selHour == 23 ? "now" : hf.format(new Date(hourStarts[selHour + 1])));
-        text(c, range, 18, TXT, true).setPadding(0, dp(14), 0, 0);
-        statsRow(c, hourSeg);
-        appsCard(hourSeg, "Battery usage by app (" + range + ")", null, false);
+        hourStatsBox = box(c);
+        hourAppsBox = box(root);
+        into(hourStatsBox, this::hourStats);
+        into(hourAppsBox, this::hourApps);
     }
+
+    LinearLayout hourStatsBox, hourAppsBox, weekStatsBox, weekAppsBox;
+
+    LinearLayout box(LinearLayout parent) {
+        LinearLayout b = new LinearLayout(this);
+        b.setOrientation(LinearLayout.VERTICAL);
+        b.setClipChildren(false);
+        parent.addView(b, new LinearLayout.LayoutParams(-1, -2));
+        return b;
+    }
+
+    String hourRange() {
+        SimpleDateFormat hf = new SimpleDateFormat("HH:mm", Locale.US);
+        return hf.format(new Date(hourStarts[selHour])) + "–" + (selHour == 23 ? "now" : hf.format(new Date(hourStarts[selHour + 1])));
+    }
+    void hourStats() {
+        text(root, hourRange(), 18, TXT, true).setPadding(0, dp(14), 0, 0);
+        statsRow(root, hourSeg);
+    }
+    void hourApps() { appsCard(hourSeg, "Battery usage by app (" + hourRange() + ")", null, false); }
 
     void buildWeek() {
         if (dayTotal == null) return;
@@ -800,13 +889,23 @@ public class MainActivity extends Activity {
         if (hrs % 2 == 1) hrs++;                       // even number of hours so the middle line is whole
         String[] vals = new String[7];
         for (int i = 0; i < 7; i++) vals[i] = fmtHM(dayOn[i]);
-        if (weekChart == null) weekChart = new BarChart(this, i -> { selDay = i; load(2); });
+        if (weekChart == null) weekChart = new BarChart(this, i -> { selDay = i; load(2, true); });
         weekChart.setData(dayOn, labels, vals, tips, selDay, hrs * 3600000L);
         weekChart.dimViews = new View[]{hint};
         c.addView(detach(weekChart), lp);
+        weekStatsBox = box(c);
+        weekAppsBox = box(root);
+        into(weekStatsBox, this::weekStats);
+        into(weekAppsBox, this::weekApps);
+    }
+
+    void weekStats() {
         String day = selDay == 6 ? "Today" : new SimpleDateFormat("EEEE, d MMM", Locale.getDefault()).format(new Date(dayStarts[selDay]));
-        text(c, day, 18, TXT, true).setPadding(0, dp(14), 0, 0);
-        statsRow(c, dayTotal);
+        text(root, day, 18, TXT, true).setPadding(0, dp(14), 0, 0);
+        statsRow(root, dayTotal);
+    }
+
+    void weekApps() {
         if (daySegs.size() >= 2) {
             section(daySegs.size() + " battery cycles on this day");
             int n = 1;
@@ -889,14 +988,37 @@ public class MainActivity extends Activity {
         apps.sort((a, b) -> Double.compare(b.getValue(), a.getValue()));
         double total = 0;
         for (Map.Entry<String, Double> e : apps) total += e.getValue();
-        int n = 0;
+        List<Map.Entry<String, Double>> shown = new ArrayList<>();
         for (Map.Entry<String, Double> e : apps) {
-            if (e.getValue() < 30000 * BG_WEIGHT || n >= 60) break;
-            n++;
-            String k = e.getKey();
-            appRow(c, k, s.st.apps.getOrDefault(k, 0L), s.st.bg.getOrDefault(k, 0L), e.getValue(), total, s.used);
+            if (e.getValue() < 30000 * BG_WEIGHT || shown.size() >= 60) break;
+            shown.add(e);
         }
-        if (n == 0) text(c, "No app usage recorded.", 14, SUB, false);
+        final double tot = total;
+        final int FIRST = 15;
+        for (int i = 0; i < Math.min(FIRST, shown.size()); i++) {
+            String k = shown.get(i).getKey();
+            appRow(c, k, s.st.apps.getOrDefault(k, 0L), s.st.bg.getOrDefault(k, 0L), shown.get(i).getValue(), tot, s.used);
+        }
+        if (shown.size() > FIRST) {
+            TextView more = new TextView(this);
+            more.setText("Show all " + shown.size() + " apps");
+            more.setTextSize(15);
+            more.setTextColor(BLUE);
+            more.setGravity(Gravity.CENTER);
+            more.setPadding(0, dp(12), 0, dp(4));
+            more.setOnClickListener(v -> {
+                c.removeView(more);
+                for (int i = FIRST; i < shown.size(); i++) {
+                    String k = shown.get(i).getKey();
+                    appRow(c, k, s.st.apps.getOrDefault(k, 0L), s.st.bg.getOrDefault(k, 0L), shown.get(i).getValue(), tot, s.used);
+                    View row = c.getChildAt(c.getChildCount() - 1);
+                    row.setAlpha(0f);
+                    row.animate().alpha(1f).setStartDelay(Math.min(12, i - FIRST) * 18L).setDuration(200).start();
+                }
+            });
+            c.addView(more);
+        }
+        if (shown.isEmpty()) text(c, "No app usage recorded.", 14, SUB, false);
     }
 
     void appRow(LinearLayout parent, String pkg, long ms, long bgMs, double w, double total, int used) {
@@ -904,8 +1026,14 @@ public class MainActivity extends Activity {
         row.setGravity(Gravity.CENTER_VERTICAL);
         row.setPadding(0, dp(10), 0, dp(10));
         ImageView iv = new ImageView(this);
-        Drawable icon = icon(pkg);
-        if (icon != null) iv.setImageDrawable(icon);
+        Drawable cached = iconCache.get(pkg);
+        if (cached != null) iv.setImageDrawable(cached);
+        else if (!iconCache.containsKey(pkg)) {
+            iconLoader.execute(() -> {
+                Drawable dr = icon(pkg);
+                if (dr != null) iv.post(() -> { iv.setImageDrawable(dr); iv.setAlpha(0f); iv.animate().alpha(1f).setDuration(150).start(); });
+            });
+        }
         LinearLayout.LayoutParams ilp = new LinearLayout.LayoutParams(dp(40), dp(40));
         ilp.rightMargin = dp(14);
         row.addView(iv, ilp);
