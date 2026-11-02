@@ -192,7 +192,7 @@ public class MainActivity extends Activity {
     // ================= Data model =================
     static final long DAY = 24L * 3600 * 1000;
     static final int BG = 0xFF000000, CARD = 0xFF1C1C1E, TXT = 0xFFFFFFFF, SUB = 0xFF8E8E93,
-            BLUE = 0xFF3B82F6, DBLUE = 0xFF1E40AF, GREEN = 0xFF22C55E, GREY = 0xFF48484A, SEL = 0xFF3A3A3C;
+            BLUE = 0xFF3B82F6, LBLUE = 0xFF7DD3FC, DBLUE = 0xFF1E40AF, GREEN = 0xFF22C55E, GREY = 0xFF48484A, SEL = 0xFF3A3A3C;
 
     static class Stats { long on, off; Map<String, Long> apps = new HashMap<>(), bg = new HashMap<>(); }
     static final double BG_WEIGHT = 0.3; // background work assumed ~30% as costly as on-screen use
@@ -220,6 +220,8 @@ public class MainActivity extends Activity {
     Seg cur, lastDone, dayTotal;
     List<Seg> daySegs = new ArrayList<>();
     List<long[]> chartPts = new ArrayList<>();
+    long[] sinceOn = new long[0], sinceOff = new long[0], sinceStarts = new long[0];
+    int[] sinceLvl = new int[0];
     long[] dayOn = new long[7], dayStarts = new long[7], hourOn = new long[24], hourStarts = new long[25];
     Seg hourSeg;
     final Map<String, Drawable> iconCache = new HashMap<>();
@@ -302,6 +304,21 @@ public class MainActivity extends Activity {
                 }
                 if (s.endLvl >= 0) pts.add(new long[]{s.to, s.endLvl});
                 temps(s, samples);
+                // one bucket per clock hour, from the unplug hour to now
+                long h0 = s.from - s.from % 3600000L;
+                int n = (int) Math.max(1, (s.to - h0 + 3599999) / 3600000L);
+                long[] b = new long[n + 1];
+                b[0] = s.from;
+                for (int i = 1; i < n; i++) b[i] = h0 + i * 3600000L;
+                b[n] = s.to;
+                Stats[] hs = computeMulti(b);
+                long[] on2 = new long[n], off2 = new long[n], st2 = new long[n];
+                int[] lv = new int[n];
+                for (int i = 0; i < n; i++) {
+                    on2[i] = hs[i].on; off2[i] = hs[i].off; st2[i] = h0 + i * 3600000L;
+                    lv[i] = levelAt(pts, b[i + 1]);
+                }
+                runOnUiThread(() -> { sinceOn = on2; sinceOff = off2; sinceStarts = st2; sinceLvl = lv; });
             }
         } else if (t == 1) {
             long[] hb = new long[25];
@@ -347,6 +364,19 @@ public class MainActivity extends Activity {
             chartPts = pts; dayStarts = starts; daySegs = segs;
             if (t == 2) dayOn = on;
         });
+    }
+
+    /** Battery % at time t, straight-line between the readings we have. */
+    static int levelAt(List<long[]> pts, long t) {
+        long[] prev = null;
+        for (long[] p : pts) {
+            if (p[0] >= t) {
+                if (prev == null || p[0] == prev[0]) return (int) p[1];
+                return (int) Math.round(prev[1] + (p[1] - prev[1]) * (double) (t - prev[0]) / (p[0] - prev[0]));
+            }
+            prev = p;
+        }
+        return prev == null ? -1 : (int) prev[1];
     }
 
     static void temps(Seg s, JSONArray samples) throws Exception {
@@ -527,23 +557,112 @@ public class MainActivity extends Activity {
     }
 
     void buildSince() {
-        LinearLayout c = card(root);
-        if (chargingNow) text(c, "⚡ Charging now" + (curLvl >= 0 ? " · " + curLvl + "%" : ""), 15, GREEN, true);
         Seg s = cur != null ? cur : lastDone;
+        LinearLayout c = card(root);
         if (s == null) {
-            text(c, "No unplug recorded yet. Unplug your charger (or tap \"Mark just unplugged\") and come back.", 14, SUB, false);
+            text(c, chargingNow ? "Charging now" + (curLvl >= 0 ? " · " + curLvl + "%" : "")
+                    : "No unplug recorded yet. Unplug your charger (or tap \"Mark just unplugged\") and come back.", 15, TXT, false);
             return;
         }
-        text(c, cur != null ? "Used since last charge" : "Last time on battery", 13, SUB, false);
-        text(c, fmt(s.to - s.from), 28, TXT, true);
-        text(c, "Unplugged " + when(s.uAt) + " at " + s.startLvl + "%" + (s.partial ? " (tracking started)" : ""), 13, SUB, false);
-        if (s.pAt != 0) text(c, "Plugged in " + when(s.pAt) + " at " + s.endLvl + "%", 13, SUB, false);
-        else if (curLvl >= 0) text(c, "Now " + curLvl + "%", 13, SUB, false);
-        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(-1, dp(150));
-        lp.topMargin = dp(12);
-        c.addView(new LineChart(this, chartPts, s.from, s.to), lp);
-        statsRow(c, s);
+        // Header: "Last charged to 90%"  /  "5 h 25 m ago"   ● Charging now
+        TextView h = new TextView(this);
+        android.text.SpannableStringBuilder sb = new android.text.SpannableStringBuilder("Last charged to ");
+        int st0 = sb.length();
+        sb.append(s.startLvl + "%");
+        sb.setSpan(new android.text.style.StyleSpan(Typeface.BOLD), st0, sb.length(), 0);
+        sb.setSpan(new android.text.style.RelativeSizeSpan(1.15f), st0, sb.length(), 0);
+        h.setText(sb);
+        h.setTextSize(22);
+        h.setTextColor(TXT);
+        c.addView(h);
+        LinearLayout sub = new LinearLayout(this);
+        sub.setGravity(Gravity.CENTER_VERTICAL);
+        TextView ago = new TextView(this);
+        ago.setText(fmtHM((cur != null ? System.currentTimeMillis() : s.pAt) - s.uAt) + " ago" + (s.partial ? " (tracking started)" : ""));
+        ago.setTextSize(15);
+        ago.setTextColor(SUB);
+        sub.addView(ago, new LinearLayout.LayoutParams(0, -2, 1));
+        TextView leg = new TextView(this);
+        leg.setText(chargingNow ? "● Charging now" : "Now " + curLvl + "%");
+        leg.setTextSize(14);
+        leg.setTextColor(chargingNow ? GREEN : SUB);
+        sub.addView(leg);
+        sub.setPadding(0, dp(4), 0, dp(8));
+        c.addView(sub);
+
+        int slots = Math.max(12, sinceOn.length);
+        String[] labels = new String[slots];
+        Calendar k = Calendar.getInstance();
+        for (int i = 0; i < slots; i++) {
+            labels[i] = "";
+            if (i == sinceOn.length - 1) labels[i] = "Now";
+            else if (i < sinceStarts.length) {
+                k.setTimeInMillis(sinceStarts[i]);
+                int hr = k.get(Calendar.HOUR_OF_DAY);
+                if (hr % 4 == 0 || i == 0) labels[i] = String.valueOf(hr);
+            }
+        }
+        // Battery level per hour
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(-1, dp(170));
+        c.addView(new HourChart(this, slots, labels, sinceLvl, null, null), lp);
+
+        // Big totals
+        LinearLayout tot = new LinearLayout(this);
+        tot.setPadding(0, dp(22), 0, dp(4));
+        tot.addView(bigStat(s.st.on, "Screen on", BLUE, false), new LinearLayout.LayoutParams(0, -2, 1));
+        tot.addView(bigStat(s.st.off, "Screen off", LBLUE, true), new LinearLayout.LayoutParams(0, -2, 1));
+        c.addView(tot);
+        // Screen on / off per hour, stacked
+        LinearLayout.LayoutParams lp2 = new LinearLayout.LayoutParams(-1, dp(170));
+        lp2.topMargin = dp(10);
+        c.addView(new HourChart(this, slots, labels, null, sinceOn, sinceOff), lp2);
+
+        // Extra detail the phone's own page doesn't give
+        View div = new View(this);
+        div.setBackgroundColor(GREY);
+        LinearLayout.LayoutParams dl = new LinearLayout.LayoutParams(-1, Math.max(1, dp(1) / 2));
+        dl.topMargin = dp(16);
+        c.addView(div, dl);
+        String used = s.used >= 0 ? "Battery used " + s.used + "%  (" + s.startLvl + "% → " + s.endLvl + "%)" : "Battery used —";
+        text(c, used, 15, TXT, true).setPadding(0, dp(12), 0, 0);
+        if (s.used > 0)
+            text(c, "1% battery ≈ " + fmtS(s.st.on / s.used) + " of screen-on time  ·  ≈ " + fmtS((s.to - s.from) / s.used) + " of total time", 13, SUB, false);
+        tempRow(c, "CPU temp", s.cpu, 0xFFF97316);
+        tempRow(c, "Battery temp", s.bat, 0xFFEAB308);
+
         appsCard(s, "Battery usage by app", null, false);
+    }
+
+    LinearLayout bigStat(long ms, String label, int dot, boolean alignRight) {
+        LinearLayout col = new LinearLayout(this);
+        col.setOrientation(LinearLayout.VERTICAL);
+        col.setGravity(alignRight ? Gravity.END : Gravity.START);
+        TextView v = new TextView(this);
+        String txt = fmtHM(ms);
+        android.text.SpannableString sp = new android.text.SpannableString(txt);
+        for (int i = 0; i < txt.length(); i++)
+            if (Character.isLetter(txt.charAt(i))) sp.setSpan(new android.text.style.RelativeSizeSpan(0.7f), i, i + 1, 0);
+        sp.setSpan(new android.text.style.StyleSpan(Typeface.BOLD), 0, txt.length(), 0);
+        v.setText(sp);
+        v.setTextSize(30);
+        v.setTextColor(TXT);
+        TextView l = new TextView(this);
+        android.text.SpannableString ls = new android.text.SpannableString("● " + label);
+        ls.setSpan(new android.text.style.ForegroundColorSpan(dot), 0, 1, 0);
+        l.setText(ls);
+        l.setTextSize(15);
+        l.setTextColor(SUB);
+        col.addView(v);
+        col.addView(l);
+        return col;
+    }
+
+    /** "2 h 26 m" / "24 m" / "<1 m" */
+    static String fmtHM(long ms) {
+        long m = ms / 60000;
+        if (m < 1) return "<1 m";
+        if (m >= 1440) return (m / 1440) + " d " + (m % 1440 / 60) + " h";
+        return m >= 60 ? (m / 60) + " h " + (m % 60) + " m" : m + " m";
     }
 
     void buildHours() {
@@ -914,6 +1033,70 @@ public class MainActivity extends Activity {
                     cv.drawText(l, lx, h - 4 * d, txt);
                 }
                 cal.add(Calendar.HOUR_OF_DAY, 1);
+            }
+        }
+    }
+
+    /** Per-hour chart like the phone's Battery page. Either battery level per hour (lvl, 0-100%)
+     *  or stacked screen-on / screen-off minutes per hour (on/off, 0-60 min). Empty slots on the
+     *  right are kept so the bars don't stretch. */
+    static class HourChart extends View {
+        final int slots;
+        final String[] labels;
+        final int[] lvl;
+        final long[] on, off;
+        final Paint bar = new Paint(Paint.ANTI_ALIAS_FLAG), txt = new Paint(Paint.ANTI_ALIAS_FLAG), grid = new Paint();
+        final float d;
+
+        HourChart(Context c, int slots, String[] labels, int[] lvl, long[] on, long[] off) {
+            super(c);
+            this.slots = slots; this.labels = labels; this.lvl = lvl; this.on = on; this.off = off;
+            d = c.getResources().getDisplayMetrics().density;
+            txt.setTextSize(13 * d);
+            grid.setColor(0xFF3A3A3C);
+            grid.setStrokeWidth(d);
+        }
+
+        @Override protected void onDraw(Canvas cv) {
+            float w = getWidth(), h = getHeight();
+            float right = w - 66 * d, top = 10 * d, bottom = h - 26 * d;
+            float slot = right / slots, bw = Math.min(slot * 0.62f, 16 * d);
+            boolean level = lvl != null;
+            txt.setColor(SUB);
+            String[] ax = level ? new String[]{"0%", "50%", "100%"} : new String[]{"0 min", "30 min", "60 min"};
+            for (int k = 0; k <= 2; k++) {
+                float y = bottom - (bottom - top) * k / 2f;
+                cv.drawLine(0, y, right, y, grid);
+                cv.drawText(ax[k], w - txt.measureText(ax[k]), y + 5 * d, txt);
+            }
+            int n = level ? lvl.length : on.length;
+            float r = 3 * d;
+            for (int i = 0; i < n; i++) {
+                float cx = i * slot + slot / 2, l = cx - bw / 2, rr = cx + bw / 2;
+                if (level) {
+                    if (lvl[i] < 0) continue;
+                    float y = bottom - (bottom - top) * lvl[i] / 100f;
+                    bar.setShader(new android.graphics.LinearGradient(0, y, 0, bottom, BLUE, 0xFF6EC1F5, android.graphics.Shader.TileMode.CLAMP));
+                    cv.drawRoundRect(new RectF(l, y, rr, bottom), r, r, bar);
+                    bar.setShader(null);
+                } else {
+                    float yOn = bottom - (bottom - top) * Math.min(1f, on[i] / 3600000f);
+                    float yOff = yOn - (bottom - top) * Math.min(1f, off[i] / 3600000f);
+                    yOff = Math.max(top, yOff);
+                    if (off[i] > 0) { bar.setColor(LBLUE); cv.drawRoundRect(new RectF(l, yOff, rr, yOn + r), r, r, bar); }
+                    if (on[i] > 0) { bar.setColor(BLUE); cv.drawRoundRect(new RectF(l, yOn, rr, bottom), r, r, bar);
+                        if (off[i] > 0) cv.drawRect(l, yOn, rr, yOn + r, bar); }
+                }
+            }
+            // labels, right-to-left, skipping any that would touch
+            float nextLeft = Float.MAX_VALUE;
+            for (int i = slots - 1; i >= 0; i--) {
+                if (labels[i] == null || labels[i].isEmpty()) continue;
+                float lw = txt.measureText(labels[i]);
+                float lx = Math.max(0, Math.min(right - lw, i * slot + (slot - lw) / 2));
+                if (lx + lw + 8 * d > nextLeft) continue;
+                cv.drawText(labels[i], lx, h - 5 * d, txt);
+                nextLeft = lx;
             }
         }
     }
