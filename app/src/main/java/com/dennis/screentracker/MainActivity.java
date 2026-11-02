@@ -639,7 +639,7 @@ public class MainActivity extends Activity {
         tabFrame.setPadding(dp(4), dp(4), dp(4), dp(4));
         tabPill = new View(this);
         tabPill.setBackground(round(SEL, 22));
-        tabFrame.addView(tabPill, new android.widget.FrameLayout.LayoutParams(0, -1));
+        tabFrame.addView(tabPill, new android.widget.FrameLayout.LayoutParams(0, dp(44)));   // exact size, set from the labels below
         LinearLayout row = new LinearLayout(this);
         String[] names = {"Since charge", "24 hours", "7 days"};
         tabLabels = new TextView[names.length];
@@ -657,9 +657,9 @@ public class MainActivity extends Activity {
         }
         tabFrame.addView(row, new android.widget.FrameLayout.LayoutParams(-1, -2));
         tabFrame.addOnLayoutChangeListener((v, l, t, r, bt, ol, ot, or, ob) -> {
-            int w = (r - l - dp(8)) / tabLabels.length;
+            int w = (r - l - dp(8)) / tabLabels.length, h = row.getHeight();
             android.view.ViewGroup.LayoutParams p = tabPill.getLayoutParams();
-            if (p.width != w) { p.width = w; tabPill.setLayoutParams(p); }
+            if (p.width != w || (h > 0 && p.height != h)) { p.width = w; if (h > 0) p.height = h; tabPill.setLayoutParams(p); }
             tabPill.setTranslationX(tab * w);
         });
         LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(-1, -2);
