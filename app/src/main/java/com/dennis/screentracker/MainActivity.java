@@ -555,11 +555,15 @@ public class MainActivity extends Activity {
         for (int i = 0; i < 24; i++) {
             Calendar k = Calendar.getInstance();
             k.setTimeInMillis(hourStarts[i]);
-            labels[i] = i == 23 ? "Now" : (k.get(Calendar.HOUR_OF_DAY) % 4 == 0 ? f.format(new Date(hourStarts[i])) : "");
+            labels[i] = i == 23 ? "Now" : (k.get(Calendar.HOUR_OF_DAY) % 4 == 0 && i <= 20 ? f.format(new Date(hourStarts[i])) : "");
         }
         LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(-1, dp(190));
         lp.topMargin = dp(8);
-        c.addView(new BarChart(this, hourOn, labels, selHour, i -> { selHour = i; load(); }), lp);
+        String[] tips = new String[24];
+        SimpleDateFormat tf = new SimpleDateFormat("HH:mm", Locale.US);
+        for (int i = 0; i < 24; i++)
+            tips[i] = tf.format(new Date(hourStarts[i])) + "–" + (i == 23 ? "now" : tf.format(new Date(hourStarts[i + 1])));
+        c.addView(new BarChart(this, hourOn, labels, tips, selHour, 3600000L, i -> { selHour = i; load(); }), lp);
         SimpleDateFormat hf = new SimpleDateFormat("HH:mm", Locale.US);
         String range = hf.format(new Date(hourStarts[selHour])) + "–" + (selHour == 23 ? "now" : hf.format(new Date(hourStarts[selHour + 1])));
         text(c, range, 18, TXT, true).setPadding(0, dp(14), 0, 0);
@@ -576,7 +580,13 @@ public class MainActivity extends Activity {
         for (int i = 0; i < 7; i++) labels[i] = i == 6 ? "Today" : f.format(new Date(dayStarts[i]));
         LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(-1, dp(190));
         lp.topMargin = dp(8);
-        c.addView(new BarChart(this, dayOn, labels, selDay, i -> { selDay = i; load(); }), lp);
+        String[] tips = new String[7];
+        SimpleDateFormat df = new SimpleDateFormat("EEE d MMM", Locale.getDefault());
+        long mx = 0;
+        for (int i = 0; i < 7; i++) { tips[i] = df.format(new Date(dayStarts[i])); mx = Math.max(mx, dayOn[i]); }
+        long hrs = Math.max(2, (mx + 3599999) / 3600000);
+        if (hrs % 2 == 1) hrs++;                       // even number of hours so the middle line is whole
+        c.addView(new BarChart(this, dayOn, labels, tips, selDay, hrs * 3600000L, i -> { selDay = i; load(); }), lp);
         String day = selDay == 6 ? "Today" : new SimpleDateFormat("EEEE, d MMM", Locale.getDefault()).format(new Date(dayStarts[selDay]));
         text(c, day, 18, TXT, true).setPadding(0, dp(14), 0, 0);
         statsRow(c, dayTotal);
@@ -603,6 +613,12 @@ public class MainActivity extends Activity {
         statCell(row, "Screen off", fmt(s.st.off), DBLUE);
         statCell(row, "Battery used", bat, GREEN);
         parent.addView(row);
+        if (s.used > 0) {
+            String per = "1% battery ≈ " + fmtS(s.st.on / s.used) + " of screen-on time  ·  ≈ "
+                    + fmtS((s.to - s.from) / s.used) + " of total time";
+            TextView t = text(parent, per, 13, TXT, false);
+            t.setPadding(0, dp(4), 0, dp(2));
+        }
         tempRow(parent, "CPU temp", s.cpu, 0xFFF97316);
         tempRow(parent, "Battery temp", s.bat, 0xFFEAB308);
     }
@@ -614,7 +630,9 @@ public class MainActivity extends Activity {
             text(parent, "● " + name + ": " + (name.startsWith("CPU") ? "not readable on this phone / no samples yet" : "no samples yet"), 12, SUB, false);
             return;
         }
-        statCell(row, name + " min", c(t.min), dot);
+        text(parent, "● " + name, 12, SUB, false).setPadding(0, dp(8), 0, 0);
+        row.setPadding(0, 0, 0, dp(4));
+        statCell(row, "Min", c(t.min), dot);
         statCell(row, "Avg", c((int) (t.sum / t.n)), dot);
         statCell(row, "Max", c(t.max), dot);
         parent.addView(row);
@@ -680,21 +698,46 @@ public class MainActivity extends Activity {
         name.setText(label(pkg));
         name.setTextSize(16);
         name.setTextColor(TXT);
-        TextView info = new TextView(this);
-        String pct;
-        // Share of this period's battery use (all apps add up to 100%, like the phone's Battery page),
-        // plus the estimated chunk of the whole battery it used.
-        pct = String.format(Locale.US, "%.2f%%", total > 0 ? 100.0 * w / total : 0);
-        if (used >= 0 && total > 0) pct += String.format(Locale.US, " (≈%.1f%% battery)", used * w / total);
         String time = ms > 0 ? fmt(ms) + " on screen" : "";
         if (bgMs >= 60000) time += (time.isEmpty() ? "" : " · ") + fmt(bgMs) + " background";
         if (time.isEmpty()) time = "<1 min";
-        info.setText(pct + "  |  " + time);
+        double share = total > 0 ? 100.0 * w / total : 0;
+        TextView info = new TextView(this);
+        info.setText(time);
         info.setTextSize(13);
         info.setTextColor(SUB);
+        TextView info2 = new TextView(this);
+        String l2 = String.format(Locale.US, "%.1f%% of the battery drain", share);
+        double appPct = used >= 0 && total > 0 ? used * w / total : -1;
+        if (appPct >= 0.05) l2 += "  ·  1% ≈ " + fmtS((long) ((ms + bgMs) / appPct)) + " of use";
+        info2.setText(l2);
+        info2.setTextSize(12);
+        info2.setTextColor(SUB);
         col.addView(name);
         col.addView(info);
+        col.addView(info2);
         row.addView(col, new LinearLayout.LayoutParams(0, -2, 1));
+        // Right side: the one number that matters - how much of the battery this app used
+        LinearLayout rc = new LinearLayout(this);
+        rc.setOrientation(LinearLayout.VERTICAL);
+        rc.setGravity(Gravity.END);
+        TextView big = new TextView(this);
+        big.setText(appPct >= 0 ? String.format(Locale.US, appPct < 10 ? "%.1f%%" : "%.0f%%", appPct)
+                : String.format(Locale.US, "%.0f%%", share));
+        big.setTextSize(18);
+        big.setTextColor(TXT);
+        big.setTypeface(Typeface.DEFAULT_BOLD);
+        big.setGravity(Gravity.END);
+        TextView unit = new TextView(this);
+        unit.setText(appPct >= 0 ? "of battery" : "of use");
+        unit.setTextSize(11);
+        unit.setTextColor(SUB);
+        unit.setGravity(Gravity.END);
+        rc.addView(big);
+        rc.addView(unit);
+        LinearLayout.LayoutParams rlp = new LinearLayout.LayoutParams(-2, -2);
+        rlp.leftMargin = dp(10);
+        row.addView(rc, rlp);
         parent.addView(row);
     }
 
@@ -795,6 +838,12 @@ public class MainActivity extends Activity {
         return h > 0 ? h + "h " + (m % 60) + "min" : m + " min";
     }
 
+    static String fmtS(long ms) {
+        if (ms >= 3600000L) return fmt(ms);
+        long m = ms / 60000, sec = (ms / 1000) % 60;
+        return m > 0 ? m + " min" + (m < 10 && sec > 0 ? " " + sec + " s" : "") : sec + " s";
+    }
+
     static String hm(long t) { return new SimpleDateFormat("h:mm a", Locale.getDefault()).format(new Date(t)); }
     static String when(long t) { return new SimpleDateFormat("EEE d MMM, h:mm a", Locale.getDefault()).format(new Date(t)); }
 
@@ -871,63 +920,92 @@ public class MainActivity extends Activity {
 
     static class BarChart extends View {
         final long[] v;
-        final String[] labels;
+        final String[] labels, tips;
         final int sel;
+        final long axisMax;
         final OnPick cb;
-        final Paint bar = new Paint(Paint.ANTI_ALIAS_FLAG), txt = new Paint(Paint.ANTI_ALIAS_FLAG), grid = new Paint();
+        final Paint bar = new Paint(Paint.ANTI_ALIAS_FLAG), txt = new Paint(Paint.ANTI_ALIAS_FLAG),
+                grid = new Paint(Paint.ANTI_ALIAS_FLAG), bubble = new Paint(Paint.ANTI_ALIAS_FLAG);
         final float d;
+        static final float AXIS_W = 62, TIP_H = 30; // dp
 
-        BarChart(Context c, long[] v, String[] labels, int sel, OnPick cb) {
+        /** Bar chart laid out like the phone's Battery page: thin rounded bars, dashed grid with
+         *  the scale on the right, a time label every few bars along the bottom, and a bubble
+         *  above the selected bar naming its time range. */
+        BarChart(Context c, long[] v, String[] labels, String[] tips, int sel, long axisMax, OnPick cb) {
             super(c);
-            this.v = v; this.labels = labels; this.sel = sel; this.cb = cb;
+            this.v = v; this.labels = labels; this.tips = tips; this.sel = sel; this.axisMax = axisMax; this.cb = cb;
             d = c.getResources().getDisplayMetrics().density;
-            txt.setTextSize(11 * d);
-            grid.setColor(GREY); grid.setStrokeWidth(d);
+            txt.setTextSize(12 * d);
+            grid.setColor(GREY);
+            grid.setStrokeWidth(d);
+            grid.setPathEffect(new android.graphics.DashPathEffect(new float[]{3 * d, 4 * d}, 0));
+            bubble.setColor(0xFF4A4A4E);
         }
+
+        static String axis(long ms) {
+            return ms < 3600000L ? (ms / 60000) + " min" : (ms / 3600000L) + " h";
+        }
+
+        float slot() { return (getWidth() - AXIS_W * d) / v.length; }
 
         @Override protected void onDraw(Canvas cv) {
             float w = getWidth(), h = getHeight();
-            float right = w - 30 * d, top = 22 * d, bottom = h - 22 * d;
-            long max = 1;
-            for (long x : v) max = Math.max(max, x);
-            long maxH = Math.max(1, (max + 3599999) / 3600000);
-            float slot = right / v.length;
+            float right = w - AXIS_W * d, top = (TIP_H + 12) * d, bottom = h - 24 * d;
+            float slot = slot();
+            // dashed grid + right-hand scale (top, middle, zero)
             txt.setColor(SUB);
-            cv.drawLine(0, bottom, right, bottom, grid);
-            cv.drawText(maxH == 1 && max <= 3600000L ? "60m" : maxH + "h", right + 6 * d, top + 4 * d, txt);
-            cv.drawText("0h", right + 6 * d, bottom + 4 * d, txt);
-            for (int i = 0; i < v.length; i++) {
-                float bh = (bottom - top) * v[i] / (float) (maxH * 3600000L);
-                RectF r = new RectF(i * slot + slot * 0.22f, bottom - bh, (i + 1) * slot - slot * 0.22f, bottom);
-                bar.setColor(i == sel ? BLUE : GREY);
-                cv.drawRoundRect(r, 4 * d, 4 * d, bar);
-                txt.setColor(i == sel ? TXT : SUB);
-
-                if (i == sel) {
-                    String s = fmt(v[i]);
-                    float sw = txt.measureText(s);
-                    float x = Math.max(0, Math.min(right - sw, i * slot + (slot - sw) / 2));
-                    cv.drawText(s, x, bottom - bh - 6 * d, txt);
-                }
+            for (int k = 0; k <= 2; k++) {
+                float y = bottom - (bottom - top) * k / 2f;
+                cv.drawLine(0, y, right, y, grid);
+                String l = axis(axisMax * k / 2);
+                txt.setTextSize(11 * d);
+                cv.drawText(l, w - txt.measureText(l) - 2 * d, y + 4 * d, txt);
+                txt.setTextSize(12 * d);
             }
-            // Axis labels, drawn right-to-left so "Now"/"Today" always shows; any label that would
-            // touch its neighbour is skipped instead of overlapping.
+            // bars
+            float bw = Math.max(3 * d, Math.min(slot * 0.5f, 10 * d));
+            for (int i = 0; i < v.length; i++) {
+                float bh = Math.min(1f, v[i] / (float) Math.max(1, axisMax)) * (bottom - top);
+                if (v[i] > 0) bh = Math.max(bh, 2 * d);
+                float cx = i * slot + slot / 2;
+                bar.setColor(i == sel ? BLUE : GREY);
+                cv.drawRoundRect(new RectF(cx - bw / 2, bottom - bh, cx + bw / 2, bottom), bw / 2, bw / 2, bar);
+            }
+            // bottom labels, right-to-left so the last one ("Now"/"Today") always shows; skip any that would touch
             float nextLeft = Float.MAX_VALUE;
             for (int i = v.length - 1; i >= 0; i--) {
                 if (labels[i].isEmpty()) continue;
                 float lw = txt.measureText(labels[i]);
                 float lx = Math.max(0, Math.min(right - lw, i * slot + (slot - lw) / 2));
-                if (lx + lw + 6 * d > nextLeft) continue;
-                txt.setColor(i == sel ? TXT : SUB);
+                if (lx + lw + 8 * d > nextLeft) continue;
+                txt.setColor(SUB);
                 cv.drawText(labels[i], lx, h - 4 * d, txt);
                 nextLeft = lx;
+            }
+            // bubble above the selected bar
+            if (sel >= 0 && sel < v.length && tips != null) {
+                String t = tips[sel];
+                txt.setTextSize(12 * d);
+                float tw = txt.measureText(t) + 16 * d, th = 24 * d;
+                float cx = sel * slot + slot / 2;
+                float bx = Math.max(0, Math.min(right - tw, cx - tw / 2));
+                RectF r = new RectF(bx, 2 * d, bx + tw, 2 * d + th);
+                cv.drawRoundRect(r, 7 * d, 7 * d, bubble);
+                Path p = new Path();
+                p.moveTo(cx - 5 * d, r.bottom); p.lineTo(cx + 5 * d, r.bottom); p.lineTo(cx, r.bottom + 5 * d); p.close();
+                cv.drawPath(p, bubble);
+                txt.setColor(TXT);
+                cv.drawText(t, bx + 8 * d, r.top + 16.5f * d, txt);
+                // faint guide line from bubble to bar
+                Paint g = new Paint(grid); g.setPathEffect(null); g.setAlpha(60);
+                cv.drawLine(cx, r.bottom + 5 * d, cx, bottom, g);
             }
         }
 
         @Override public boolean onTouchEvent(MotionEvent e) {
             if (e.getAction() == MotionEvent.ACTION_UP) {
-                float slot = (getWidth() - 30 * d) / v.length;
-                int i = (int) (e.getX() / slot);
+                int i = (int) (e.getX() / slot());
                 if (i >= 0 && i < v.length && cb != null) cb.pick(i);
                 performClick();
             }
