@@ -232,6 +232,11 @@ public class MainActivity extends Activity {
     List<long[]> chartPts = new ArrayList<>();
     long[] sinceOn = new long[0], sinceOff = new long[0], sinceStarts = new long[0];
     int[] sinceLvl = new int[0];
+    Seg[] sinceHours = new Seg[0];
+    int sinceSel = -1;                       // hour picked on the Since charge charts (-1 = whole period)
+    LinearLayout sinceTotBox, sinceAppsBox;
+    String[] sinceRng = new String[0];
+    Seg sinceWhole;
     long[] dayOn = new long[7], dayStarts = new long[7], hourOn = new long[24], hourStarts = new long[25];
     Seg hourSeg;
     final Map<String, Drawable> iconCache = java.util.Collections.synchronizedMap(new HashMap<>());
@@ -383,7 +388,17 @@ public class MainActivity extends Activity {
                     on2[i] = hs[i].on; off2[i] = hs[i].off; st2[i] = h0 + i * 3600000L;
                     lv[i] = levelAt(pts, b[i + 1]);
                 }
-                runOnUiThread(() -> { sinceOn = on2; sinceOff = off2; sinceStarts = st2; sinceLvl = lv; });
+                Seg[] hsegs = new Seg[n];
+                for (int i = 0; i < n; i++) {
+                    Seg hs1 = new Seg();
+                    hs1.from = b[i]; hs1.to = b[i + 1]; hs1.st = hs[i];
+                    int before = i == 0 ? s.startLvl : lv[i - 1];
+                    hs1.used = before >= 0 && lv[i] >= 0 ? Math.max(0, before - lv[i]) : -1;
+                    hs1.est = true;                    // levels between readings are estimated
+                    temps(hs1, samples);
+                    hsegs[i] = hs1;
+                }
+                runOnUiThread(() -> { sinceOn = on2; sinceOff = off2; sinceStarts = st2; sinceLvl = lv; sinceHours = hsegs; });
             }
         } else if (t == 1) {
             long[] hb = new long[25];
@@ -784,20 +799,27 @@ public class MainActivity extends Activity {
         lvlChart.dimViews = new View[]{h, sub};
         c.addView(detach(lvlChart), lp);
 
-        // Big totals
+        // Big totals (for the whole period, or the picked hour)
+        sinceWhole = s;
+        sinceRng = rng;
+        if (sinceSel >= sinceHours.length) sinceSel = -1;
         LinearLayout tot = new LinearLayout(this);
         tot.setPadding(0, dp(22), 0, dp(4));
-        View bOn = bigStat(s.st.on, "Screen on", BLUE, false);
-        tot.addView(bOn, new LinearLayout.LayoutParams(0, -2, 1));
-        tot.addView(bigStat(s.st.off, "Screen off", LBLUE, true), new LinearLayout.LayoutParams(0, -2, 1));
+        sinceTotBox = tot;
+        fillSinceTotals();
         c.addView(tot);
         // Screen on / off per hour, stacked
         LinearLayout.LayoutParams lp2 = new LinearLayout.LayoutParams(-1, dp(170));
         lp2.topMargin = dp(10);
         if (stackChart == null) stackChart = new HourChart(this);
         stackChart.setData(slots, labels, null, sinceOn, sinceOff, onv, offr);
-        stackChart.dimViews = new View[]{tot};
+        stackChart.showTip = false;               // like the phone: the card shows on the top chart only
         c.addView(detach(stackChart), lp2);
+        lvlChart.sticky = stackChart.sticky = true;
+        lvlChart.onSel = stackChart.onSel = (i) -> sinceSelect(i, false);
+        lvlChart.onDone = stackChart.onDone = (i) -> sinceSelect(i, true);
+        lvlChart.setSel(sinceSel);
+        stackChart.setSel(sinceSel);
 
         // Extra detail the phone's own page doesn't give
         View div = new View(this);
@@ -812,7 +834,40 @@ public class MainActivity extends Activity {
         tempRow(c, "CPU temp", s.cpu, 0xFFF97316);
         tempRow(c, "Battery temp", s.bat, 0xFFEAB308);
 
-        appsCard(s, "Battery usage by app", null, false);
+        sinceAppsBox = box(root);
+        sinceAppsBox.setTag(sinceSel);
+        into(sinceAppsBox, this::sinceApps);
+    }
+
+    void fillSinceTotals() {
+        Seg h = sinceSel >= 0 ? sinceHours[sinceSel] : sinceWhole;
+        sinceTotBox.removeAllViews();
+        sinceTotBox.addView(bigStat(h.st.on, "Screen on", BLUE, false), new LinearLayout.LayoutParams(0, -2, 1));
+        sinceTotBox.addView(bigStat(h.st.off, "Screen off", LBLUE, true), new LinearLayout.LayoutParams(0, -2, 1));
+    }
+
+    void sinceApps() {
+        if (sinceSel >= 0) appsCard(sinceHours[sinceSel], "Battery usage by app (" + sinceRng[sinceSel] + ")", null, false);
+        else appsCard(sinceWhole, "Battery usage by app", null, false);
+    }
+
+    /** A bar was touched on either Since-charge chart (i = -1: cleared). Both charts follow; totals update
+     *  live while sliding, the app list once the finger lifts. */
+    void sinceSelect(int i, boolean full) {
+        if (sinceTotBox == null || sinceAppsBox == null) return;
+        boolean changed = i != sinceSel;
+        sinceSel = i;
+        if (lvlChart != null) lvlChart.setSel(i);
+        if (stackChart != null) stackChart.setSel(i);
+        if (changed) fillSinceTotals();
+        if (full) {
+            if (sinceAppsBox.getTag() != null && (int) sinceAppsBox.getTag() == i) return;
+            sinceAppsBox.setTag(i);
+            sinceAppsBox.removeAllViews();
+            into(sinceAppsBox, this::sinceApps);
+            sinceAppsBox.setAlpha(0.35f);
+            sinceAppsBox.animate().alpha(1f).setDuration(220).setInterpolator(EASE).start();
+        }
     }
 
     LinearLayout bigStat(long ms, String label, int dot, boolean alignRight) {
@@ -1323,6 +1378,21 @@ public class MainActivity extends Activity {
         final int slop;
         final Runnable hide = () -> fadeTip(0f);
         View[] dimViews = new View[0];               // text the card floats over; dimmed while it shows
+        boolean showTip = true;                      // draw the value card (only the top Since-charge chart does)
+        boolean sticky;                              // selection stays after lifting; tap the same bar again to clear
+        OnPick onSel, onDone;                        // live while touching / when the finger lifts (-1 = cleared)
+        int prevSel = -1;
+        boolean tapOnSelected;
+
+        /** Set the selection from outside (the other chart was touched). Doesn't call back. */
+        void setSel(int i) {
+            removeCallbacks(hide);
+            if (i < 0 || i >= count()) { if (sel >= 0) { fadeTip(0f); } return; }
+            if (tipX < 0 || sel < 0 || tipAlpha < 0.05f) { sel = i; tipX = getWidth() > 0 ? cx(i) : -1; }
+            else if (i != sel) { sel = i; anim(aX, tipX, cx(i), 140, v -> tipX = v, 2); }
+            if (tipAlpha < 0.99f || focus < 0.99f) fadeTip(1f);
+            invalidate();
+        }
 
         TouchChart(Context c) {
             super(c);
@@ -1367,8 +1437,9 @@ public class MainActivity extends Activity {
         }
         void select(int i, boolean animate) {
             i = Math.max(0, Math.min(count() - 1, i));
-            if (i == sel && tipX >= 0) return;
+            if (i == sel && tipX >= 0 && tipAlpha > 0.05f) return;
             sel = i;
+            if (onSel != null) onSel.pick(i);
             float target = cx(i);
             if (!animate || tipX < 0) { tipX = target; invalidate(); }
             else anim(aX, tipX, target, 140, v -> tipX = v, 2);
@@ -1382,24 +1453,34 @@ public class MainActivity extends Activity {
                 case MotionEvent.ACTION_DOWN:
                     removeCallbacks(hide);
                     downX = e.getX(); downY = e.getY(); dragging = false;
+                    int at = Math.max(0, Math.min(count() - 1, indexAt(e.getX())));
+                    prevSel = tipAlpha > 0.5f ? sel : -1;
+                    tapOnSelected = sticky && prevSel == at;
                     if (tipX < 0 && sel >= 0) tipX = cx(sel);
-                    select(indexAt(e.getX()), true);
-                    fadeTip(1f);
+                    if (!tapOnSelected) { select(at, true); fadeTip(1f); }
                     return true;
                 case MotionEvent.ACTION_MOVE:
                     if (!dragging && Math.abs(e.getX() - downX) > slop && Math.abs(e.getX() - downX) > Math.abs(e.getY() - downY)) {
                         dragging = true;
                         getParent().requestDisallowInterceptTouchEvent(true);   // horizontal slide = scrub, not scroll
                     }
-                    if (dragging) select(indexAt(e.getX()), true);
+                    if (dragging) { tapOnSelected = false; select(indexAt(e.getX()), true); fadeTip(1f); }
                     return true;
                 case MotionEvent.ACTION_UP:
                     performClick();
-                    onPicked(sel);
-                    postDelayed(hide, 1400);
+                    if (sticky) {
+                        if (tapOnSelected && !dragging) { fadeTip(0f); if (onSel != null) onSel.pick(-1); if (onDone != null) onDone.pick(-1); }
+                        else if (onDone != null) onDone.pick(sel);
+                    } else {
+                        onPicked(sel);
+                        postDelayed(hide, 1400);
+                    }
                     return true;
-                case MotionEvent.ACTION_CANCEL:
-                    postDelayed(hide, 200);
+                case MotionEvent.ACTION_CANCEL:   // page started scrolling: undo this touch
+                    if (sticky) {
+                        if (prevSel >= 0) { setSel(prevSel); if (onSel != null) onSel.pick(prevSel); }
+                        else { fadeTip(0f); if (onSel != null) onSel.pick(-1); }
+                    } else postDelayed(hide, 200);
                     return true;
             }
             return true;
@@ -1435,7 +1516,7 @@ public class MainActivity extends Activity {
         }
         /** Value card above the chart (it may float over the text above it), thin line + dot down to the bar. */
         void drawTip(Canvas cv, float plotTop) {
-            if (tipAlpha <= 0.01f || sel < 0 || sel >= tipVal.length) return;
+            if (!showTip || tipAlpha <= 0.01f || sel < 0 || sel >= tipVal.length) return;
             int al = (int) (255 * tipAlpha);
             String v = tipVal[sel], r = sel < tipRange.length ? tipRange[sel] : "";
             float pad = 14 * d, cw = Math.max(big.measureText(v), small.measureText(r)) + 2 * pad, ch = 74 * d;
@@ -1509,7 +1590,7 @@ public class MainActivity extends Activity {
         void setData(int slots, String[] labels, int[] lvl, long[] on, long[] off, String[] vals, String[] range) {
             this.slots = slots; this.labels = labels; this.lvl = lvl; this.on = on; this.off = off;
             this.tipVal = vals; this.tipRange = range;
-            if (sel >= count()) sel = -1;
+            if (sel >= count()) { sel = -1; tipAlpha = 0; focus = 0; }
             invalidate();
         }
         float top() { return 10 * d; }
@@ -1522,6 +1603,7 @@ public class MainActivity extends Activity {
         }
 
         @Override protected void onDraw(Canvas cv) {
+            if (tipX < 0 && sel >= 0 && getWidth() > 0) tipX = cx(sel);
             boolean level = lvl != null;
             drawAxis(cv, level ? new String[]{"0%", "50%", "100%"} : new String[]{"0 min", "30 min", "60 min"}, top(), bottom());
             float slot = slotW(), bw = Math.min(slot * 0.5f, 12 * d), r = 3 * d, H = bottom() - top();
